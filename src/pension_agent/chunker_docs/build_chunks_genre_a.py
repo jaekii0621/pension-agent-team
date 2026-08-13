@@ -5,7 +5,8 @@ import json
 from chunk_genre_a_schema import ChunkA
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR = "/mnt/user-data/uploads"  # 로컬에서는 data/raw로 바꿔서 쓰면 됨
+RAW_DIR = os.path.join(BASE_DIR, "..", "..", "..", "data", "raw")
+RAW_DIR = os.path.normpath(RAW_DIR)
 
 DOC_IDS = ["doc10", "doc12", "doc13", "doc14", "doc15", "doc16", "doc17", "doc18"]
 
@@ -35,6 +36,8 @@ def try_merge_across_pages(prev_tables, prev_height, curr_tables):
             and abs(px0 - cx0) < X_TOLERANCE and abs(px1 - cx1) < X_TOLERANCE:
         last_prev["data"] += first_curr["data"]
         curr_tables.pop(0)
+        # ⚠️ 참고: 병합된 표는 두 페이지에 걸쳐있으므로, 정확한 단일 page 값이 없음.
+        # 이 스크립트에서는 "표가 시작된 페이지(직전 페이지)"를 기준으로 삼음.
 
 
 def table_to_text(table):
@@ -64,20 +67,26 @@ def get_clean_words_in_order(page, exclude_tables):
 
 
 class QAParser:
-    """페이지가 넘어가도 상태(현재 어떤 질문을 파싱 중인지)를 유지하는 파서"""
+    """페이지가 넘어가도 상태(현재 어떤 질문을 파싱 중인지)를 유지하는 파서.
+    ⚠️ 수정: 각 질문(q)이 "시작된 페이지 번호"를 함께 기록하도록 확장함.
+    """
 
     def __init__(self):
         self.mode = "before_qlist"
         self.q_words = []
         self.a_words = []
         self.in_answer = False
-        self.qa_pairs = []
+        self.qa_pairs = []       # (q_text, a_text, start_page)
         self.appendix_words = []
+        self.appendix_start_page = None
+        self.current_q_start_page = None
 
-    def feed(self, tokens):
+    def feed(self, tokens, page_num):
         for tok in tokens:
             if tok == "첨부":
                 self.mode = "appendix"
+                if self.appendix_start_page is None:
+                    self.appendix_start_page = page_num
                 continue
 
             if self.mode == "appendix":
@@ -98,10 +107,15 @@ class QAParser:
             if self.mode == "qa":
                 if tok.startswith("○"):
                     if self.q_words or self.a_words:
-                        self.qa_pairs.append((" ".join(self.q_words), " ".join(self.a_words)))
+                        self.qa_pairs.append((
+                            " ".join(self.q_words),
+                            " ".join(self.a_words),
+                            self.current_q_start_page,
+                        ))
                     self.q_words = [tok.lstrip("○")] if len(tok) > 1 else []
                     self.a_words = []
                     self.in_answer = False
+                    self.current_q_start_page = page_num  # 새 질문이 시작된 페이지 기록
                 elif tok.startswith("•"):
                     self.in_answer = True
                     rest = tok.lstrip("•")
@@ -112,12 +126,18 @@ class QAParser:
                         self.a_words.append(tok)
                     else:
                         self.q_words.append(tok)
+                        if self.current_q_start_page is None:
+                            self.current_q_start_page = page_num
 
     def finalize(self):
         if self.q_words or self.a_words:
-            self.qa_pairs.append((" ".join(self.q_words), " ".join(self.a_words)))
+            self.qa_pairs.append((
+                " ".join(self.q_words),
+                " ".join(self.a_words),
+                self.current_q_start_page,
+            ))
             self.q_words, self.a_words = [], []
-        return self.qa_pairs, " ".join(self.appendix_words)
+        return self.qa_pairs, " ".join(self.appendix_words), self.appendix_start_page
 
 
 KNOWN_LAW_PREFIXES = ["근로자퇴직급여", "민사집행법", "근로기준법"]
@@ -137,8 +157,6 @@ def trim_stray_prefix(text):
 
 def split_appendix_articles(appendix_text):
     """첨부 법령 원문을, '(법령명) 제N조(제목)' 패턴 기준으로 조문 단위 청크로 분리"""
-    # (?<![가-힣]) : 매칭 시작 지점 바로 앞이 한글이면 안 됨(단어 중간에서 시작 방지)
-    # (?:[가-힣]+\s+)? : "근로자퇴직급여" 같은 법령명 앞부분(선택)까지 포함
     pattern = r'(?<![가-힣])(?:[가-힣]+\s+)?[가-힣]+법(?:\s*시행령|\s*시행규칙)?\s*제\d+조(?:의\d+)?\([^)]+\)'
     matches = list(re.finditer(pattern, appendix_text))
     if not matches:
@@ -165,65 +183,63 @@ def process_doc(doc_id):
             try_merge_across_pages(pages_tables[i - 1], pdf.pages[i - 1].height, pages_tables[i])
 
         parser = QAParser()
-        # 각 페이지 처리 직후, "이 표는 지금까지 나온 질문 중 몇 번째(전체 인덱스)에 귀속되는가"를 기록
-        pending_tables_per_page = []
+        pending_tables_per_page = []  # (target_idx, is_current, tables, table_page_num)
 
         for page_num, page in enumerate(pdf.pages, start=1):
             tables = pages_tables[page_num - 1]
             words = get_clean_words_in_order(page, tables)
             tokens = [w["text"] for w in words]
-            parser.feed(tokens)
+            parser.feed(tokens, page_num)  # ⚠️ page_num 전달하도록 수정
 
-            # 이 시점 기준 "귀속시킬 질문"의 인덱스: 이미 확정된 질문이 있으면 마지막 확정 질문,
-            # 아직 확정 안 됐지만 현재 파싱 중인 질문이 있으면 그걸로(추후 finalize시 채워짐)
             if tables:
                 if parser.qa_pairs:
                     target_idx = len(parser.qa_pairs) - 1
                     is_current = False
                 elif parser.q_words or parser.a_words:
-                    target_idx = None  # 아직 미확정 -> finalize 후 마지막 항목에 귀속
+                    target_idx = None
                     is_current = True
                 else:
                     target_idx = None
                     is_current = False
-                pending_tables_per_page.append((target_idx, is_current, tables))
+                pending_tables_per_page.append((target_idx, is_current, tables, page_num))
 
-        qa_pairs, appendix_text = parser.finalize()
+        qa_pairs, appendix_text, appendix_page = parser.finalize()
 
-        # 표 귀속 처리: is_current였던 표들은 이제 막 확정된 "그 다음 질문"이 아니라
-        # 표가 나온 시점 기준 "곧 확정될 질문" = 그 표가 나온 페이지에서 새로 시작된 질문 없이 이어지던 질문.
-        # 간단화: target_idx가 있으면 그 질문에, None(is_current)이면 마지막 질문에 귀속.
+        # (q, a, start_page) 3-tuple 리스트로 관리
         qa_list = list(qa_pairs)
-        for target_idx, is_current, tables in pending_tables_per_page:
+        for target_idx, is_current, tables, table_page_num in pending_tables_per_page:
             if is_current:
-                idx = 0  # qa_pairs가 아직 비어있던 시점 = 첫 번째 질문을 파싱 중이었다는 뜻
+                idx = 0
             else:
                 idx = target_idx
             if idx is None or idx < 0 or idx >= len(qa_list):
                 continue
-            q, a = qa_list[idx]
+            q, a, start_page = qa_list[idx]
             for t in tables:
                 a += " " + table_to_text(t)
-            qa_list[idx] = (q, a)
+            qa_list[idx] = (q, a, start_page)
 
         articles = split_appendix_articles(appendix_text)
-        return qa_list, articles
+        # appendix_page가 None이면(문서에 '첨부' 자체가 없으면) 1로 폴백
+        return qa_list, articles, (appendix_page or 1)
 
 
 if __name__ == "__main__":
     all_chunks = []
 
     for doc_id in DOC_IDS:
-        qa_pairs, articles = process_doc(doc_id)
-        chunk_no = 1
+        qa_list, articles, appendix_page = process_doc(doc_id)
+        chunk_no_by_page = {}
 
-        for q, a in qa_pairs:
+        for q, a, start_page in qa_list:
+            page = start_page or 1  # 혹시 모를 None 방어
+            chunk_no_by_page[page] = chunk_no_by_page.get(page, 0) + 1
             text = f"Q: {q}\nA: {a.strip()}"
             c = ChunkA(
-                chunk_id=f"{doc_id}#p1#c{chunk_no:03d}",
+                chunk_id=f"{doc_id}#p{page}#c{chunk_no_by_page[page]:03d}",
                 doc_id=doc_id,
                 source="제도",
-                page=1,
+                page=page,
                 text=text,
                 parse_method="text",
                 confidence=1.0,
@@ -231,14 +247,15 @@ if __name__ == "__main__":
                 distractor=False,
             )
             all_chunks.append(c)
-            chunk_no += 1
 
         for art in articles:
+            page = appendix_page
+            chunk_no_by_page[page] = chunk_no_by_page.get(page, 0) + 1
             c = ChunkA(
-                chunk_id=f"{doc_id}#p1#c{chunk_no:03d}",
+                chunk_id=f"{doc_id}#p{page}#c{chunk_no_by_page[page]:03d}",
                 doc_id=doc_id,
                 source="제도",
-                page=1,
+                page=page,
                 text=art,
                 parse_method="text",
                 confidence=1.0,
@@ -246,7 +263,6 @@ if __name__ == "__main__":
                 distractor=True,
             )
             all_chunks.append(c)
-            chunk_no += 1
 
     OUTPUT_PATH = os.path.join(BASE_DIR, "chunks_genre_a.jsonl")
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
