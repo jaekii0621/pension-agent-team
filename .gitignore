@@ -4,6 +4,8 @@
 # .env 에는 CLOVA_API_KEY 실키가 들어간다. 팀 레포에 올라가면 그대로 노출된다.
 # 설정 양식은 .env.example 로만 공유한다(키 값은 비워 둘 것).
 .env
+.env.*
+!.env.example
 .env.local
 *.key
 *.pem
