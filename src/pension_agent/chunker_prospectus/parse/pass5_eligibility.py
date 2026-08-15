@@ -102,6 +102,79 @@ def scan_eligibility(text):
     return out
 
 
+
+
+# ==============================================================
+# ★ 3차 폴백 — 가입자격 표가 **칸 단위로 세로 분해**된 문서
+#
+#   find_eligibility / scan_eligibility 가 둘 다 실패하는 문서가 많다(511행 미확인).
+#   원인은 보수 표와 같다: PDF 표의 한 칸이 여러 줄로 흘러나온다.
+#
+#     A형   '종류 C-P' / 조건문장 …
+#     B형   '종류C-P' / '수수료미징구-…' / 조건문장 / '있음'|'없음'
+#
+#   '종류X' 줄을 기준으로 다음 '종류Y'까지를 모으고,
+#   판매유형·부과여부 칸만 걸러낸다.
+# ==============================================================
+CLS = r"[A-Za-z][A-Za-z0-9\-]{0,7}"
+HEAD = re.compile(rf"^종\s*류\s*({CLS})\s*$")          # '종류 C-P' 단독 줄
+# ⚠️ '가. 집합투자기구'처럼 조건 본문이 가/나/다로 시작하는 문서가 있다(C-F 사례).
+#   섹션 헤딩만 STOP으로 본다.
+STOP = re.compile(r"^(부과기준|주\s*\d+\s*\)|\(\s*\d+\s*\)\s*[가-힣]|\d+\s*[.．]\s*[가-힣]{2,})")
+DROP = re.compile(r"^(있음|없음|해당\s*없음|-|—|구\s*분|종\s*류|판매수수료|부과여부|"
+                  r"수수료(선취|미징구|후취)[^\s]*)$")
+PAGE = re.compile(r"^-?\s*\d{1,3}\s*-?$")
+# 실제 가입자격 문장에 나타나는 말들 — 이게 있으면 판매유형 꼬리가 아니다
+_COND = re.compile(r"제한|없음|투자자|가입|전용|자격|기관|법|계좌|이상|한하여|대상|"
+                   r"온라인|누구나|개인|법인|기금")
+
+
+def eligibility_cells(lines):
+    """{class: 조건문장}. '종류X' 줄 다음부터 다음 '종류Y' 전까지를 모은다."""
+    out, cur, buf = {}, None, []
+    fee_tail = False        # 직전 줄이 판매유형 칸이면 그 꼬리를 흘려보낸다
+
+    def flush():
+        if cur and buf:
+            s = " ".join(buf).strip()
+            s = re.sub(r"\s+", " ", s)
+            if len(s) >= 3:
+                out.setdefault(cur, s[:200])
+
+    for raw in lines:
+        L = raw.strip()
+        if not L or PAGE.match(L):
+            continue
+        m = HEAD.match(L.replace(" ", "").replace("종류", "종류 ", 1)) or HEAD.match(L)
+        if m:
+            flush()
+            cur, buf = m.group(1), []
+            continue
+        if STOP.match(L):
+            flush()
+            cur, buf = None, []
+            continue
+        if cur is None:
+            continue
+        # ★ 판매유형 칸이 두 줄로 쪼개진 경우의 꼬리("…무권유저" + "비용")
+        #   ⚠️ 짧다고 무조건 버리면 '제한없음', '온라인 투자자' 같은 실제 조건까지 사라진다.
+        #   조건 키워드가 하나도 없는 짧은 조각만 꼬리로 본다.
+        if fee_tail and not buf and len(L) <= 12 and not _COND.search(L):
+            fee_tail = False
+            continue
+        fee_tail = False
+        if DROP.match(L.replace(" ", "")):
+            if re.match(r"^수수료(선취|미징구|후취)", L.replace(" ", "")):
+                fee_tail = True
+            # 판매유형/부과여부 칸은 조건이 아니다. 다만 조건을 이미 모았으면 거기서 끊는다
+            if buf:
+                flush()
+                cur, buf = None, []
+            continue
+        buf.append(L)
+    flush()
+    return out
+
 def classify(text):
     """가입자격 문장에서 판정 플래그를 뽑는다."""
     # ★ PDF 줄바꿈이 단어 안에 끼어든다("연금저축계\n좌", "퇴직연\n금").
@@ -228,6 +301,11 @@ def main():
         # ★ 2차 폴백 — 하위 헤딩이 아예 없는 문서는 줄 단위로 직접 스캔
         if not elig:
             elig = scan_eligibility(t)
+        # ★ 3차 폴백 — 표가 칸 단위로 세로 분해된 문서
+        #   ⚠️ 기존 값은 건드리지 않는다. 빠진 클래스만 채운다.
+        _cells = eligibility_cells(t.split("\n"))
+        for _k, _v in _cells.items():
+            elig.setdefault(_k, _v)
         if elig:
             rec["가입자격"] = elig
             rec["가입자격_페이지"] = locate_pages(pages, elig, info)

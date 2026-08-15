@@ -57,6 +57,10 @@ def main():
         for k, v in patch.items():
             rec[k] = v
             fields[k] = fields.get(k, 0) + 1
+        # ★ 보수를 수작업으로 다시 넣었으면 파싱 단계의 신뢰불가 플래그는 무효다.
+        #   안 지우면 이 플래그를 보는 코드가 정상 값을 계속 버린다.
+        if "보수" in patch:
+            rec.pop("보수_신뢰불가", None)
         rec["수작업보정"] = sorted(set((rec.get("수작업보정") or []) + list(patch)))
         # ★ 근거 부착 — 페이지가 있고 확인필요가 아닌 것만.
         #   답변에서 "연금저축 가입 가능"을 인용할 때 쓸 span이 여기서 나온다.

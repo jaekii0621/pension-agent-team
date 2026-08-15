@@ -57,12 +57,16 @@ def _fee_line(rec):
     클래스별 총보수. ⚠️ 보수_신뢰불가(클래스 매핑 미상)면 숫자를 쓰지 않는다.
     잘못 매핑된 보수를 카드에 박으면 그대로 인용된다.
     """
-    if rec.get("보수_신뢰불가"):
-        return f"총보수: {NA} (클래스 매핑 확인 필요)"
+    # ⚠️ 문서 단위로 차단하면 정상 행까지 사라진다. 아래 필터가 이미 '클래스명미상'
+    #   행을 걸러내므로 행 단위로 판단하면 충분하다.
+    #   (18행 중 17행이 정상인데 #N 하나 때문에 총보수 줄이 통째로 빠지던 사례)
     rows = [r for r in (rec.get("보수") or [])
             if isinstance(r.get("총보수"), (int, float)) and not r.get("클래스명미상")]
     if not rows:
-        return f"총보수: {NA}"
+        return f"총보수: {NA} (클래스 매핑 확인 필요)"
+    # ★ 종류형이 아닌 펀드는 클래스 구분이 없다. 코드 자리에 '-'가 나가면 어색하다.
+    if len(rows) == 1 and rows[0]["class"] in ("-", "#1", ""):
+        return f"총보수: {rows[0]['총보수']}% (종류형 아님 — 클래스 구분 없음)"
     parts = [f"{r['class']} {r['총보수']}%" for r in rows[:8]]
     return "클래스별 총보수: " + ", ".join(parts)
 

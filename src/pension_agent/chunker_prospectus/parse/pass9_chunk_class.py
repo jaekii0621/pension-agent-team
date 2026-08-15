@@ -217,6 +217,19 @@ def _elig(rec, cls, crec=None):
                 return "고액·기관 전용", "문서"
             if not s:
                 return NA, None
+            # ★ 긴 정형 문구는 요약한다. 표 칸에 두 줄짜리 설명이 들어가면
+            #   카드가 넓어지고 '집합투자증 권'처럼 줄바꿈 흔적이 그대로 노출된다.
+            #   전문은 섹션 원문 청크에 있으므로 여기서는 짧은 라벨이면 충분하다.
+            _sq = s.replace(" ", "")
+            for _pat, _lab in (
+                (r"투자자문업자로부터투자자문을받고", "투자자문 경유(무권유저비용)"),
+                (r"공동판매채널로서의역할", "온라인 판매채널 전용"),
+                (r"일임형|WRAPAccount|랩어카운트|특정금전신탁", "랩·금전신탁 전용"),
+                (r"전문투자자|기관투자자|국가재정법에따른기금", "고액·기관 전용"),
+                (r"최초매수일로부터\d+년", "신규 가입 불가(선행 클래스 보유 필요)"),
+            ):
+                if re.search(_pat, _sq):
+                    return _lab, "문서"
             # 표 칸이므로 첫 절만 남긴다. 전문은 섹션 원문 청크에 있다.
             s = re.split(r"(?:하며|으로서|이며|에 한하여|를 통하여)", s)[0].strip(" ,")
             if len(s) >= 4:
@@ -264,8 +277,9 @@ def _elig(rec, cls, crec=None):
 
 def _fee_map(rec):
     """클래스 → 총보수. 신뢰불가 문서는 전부 미확인 처리."""
-    if rec.get("보수_신뢰불가"):
-        return {}
+    # ⚠️ 문서 단위로 전부 버리면 정상 행까지 사라진다. 행 단위 '클래스명미상'
+    #   플래그가 이미 있으므로 그 행만 제외하면 된다(아래 루프에서 처리).
+    #   예: 18행 중 17행이 정상 코드인데 #N 하나 때문에 전부 미확인이 되던 사례.
     out = {}
     for r in (rec.get("보수") or []):
         if r.get("클래스명미상"):
@@ -344,7 +358,8 @@ def build_text(rec):
         lines.append(f"\n연금저축계좌 가입 가능 클래스: {', '.join(p_save)}"
                      f"{_pgs(p_save)} {mark}".rstrip())
     if p_ret:
-        lines.append(f"퇴직연금(IRP) 가입 가능 클래스: {', '.join(p_ret)}"
+        # ★ 연금저축 줄이 없으면 여기가 첫 요약줄이므로 빈 줄로 표와 갈라준다
+        lines.append(f"{'' if p_save else chr(10)}퇴직연금(IRP) 가입 가능 클래스: {', '.join(p_ret)}"
                      f"{_pgs(p_ret)} {mark}".rstrip())
     if not (p_save or p_ret):
         # ⚠️ 인쇄에 라벨이 없다고 '가입 불가'로 뒤집지 않는다. 미확인이다.
@@ -352,7 +367,11 @@ def build_text(rec):
     if fees:
         lo = min(fees.values())
         hi = max(fees.values())
-        lines.append(f"총보수 범위: {lo}% ~ {hi}%")
+        if lo == hi:
+            only = [c for c, v in fees.items() if v == lo]
+            lines.append(f"총보수: {lo}% ({', '.join(only[:3])} 확인분)")
+        else:
+            lines.append(f"총보수 범위: {lo}% ~ {hi}%")
     # ★ 총보수 근거 페이지 — 보수표가 두 쪽에 걸치는 문서가 많고
     #   하필 연금 클래스가 뒤쪽에 몰려 있어 문서 단위 페이지로는 인용이 어긋난다.
     fpg = sorted({p for p in (_fee_pages(rec).values()) if p})
