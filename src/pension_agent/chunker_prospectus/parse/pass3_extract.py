@@ -266,6 +266,115 @@ def classes_from_coord(pdf_path, rng):
     return out
 
 
+
+
+# ══════════════════════════════════════════════════════════════
+# ★ 4차 폴백 — 13항 표가 **칸 단위로 세로 분해**된 문서
+#
+# 좌표 재조립(3차)도 실패하는 문서들이 있다. 원인은 PDF 표의 한 칸이
+# 여러 줄로 흘러나오는 것이고, 운용사마다 형태가 다르다:
+#
+#   신영    'A(수수료' + '선취-오프' + '라인)'        ← 칸이 3줄로 쪼개짐
+#   KB      'C' / '수수료미징구-오프라인'              ← 코드와 설명이 다른 줄
+#   코레이트 '수수료미징구-' + '오프라인(C)'            ← 설명이 2줄, 코드가 끝
+#
+# 줄을 다시 붙이면(merge_cells) 셋 다 읽을 수 있는 형태가 된다. PDF 불필요.
+#
+# ⚠️ **클래스가 하나도 없는 문서에만** 적용한다.
+#    기존 목록이 있는 문서에 돌려보니 다른 집합을 찾는다(11개 → 1개인 사례).
+#    어느 쪽이 맞는지 모르는 상태에서 덮으면 회귀가 된다.
+# ══════════════════════════════════════════════════════════════
+_CS_CODE = r"[A-Za-z][A-Za-z0-9\-]{0,7}"
+_CS_DESC = re.compile(r"^수수료(미징구|선취|후취)")
+_CS_FRONT = re.compile(rf"^({_CS_CODE})\s*\(\s*(수수료.*?)\s*\)\s*$")
+_CS_BACK = re.compile(rf"^(수수료.*?)\s*\(\s*(?:종류)?\s*({_CS_CODE})\s*\)\s*$")
+_CS_BARE = re.compile(rf"^(?:종류)?\s*({_CS_CODE})$")
+_CS_STOP = re.compile(r"^(선취판매수수료|후취판매수수료|환매수수료|전환수수료|기타비용|"
+                      r"총보수|판매보수|운용보수|수탁보수|사무관리)")
+
+
+def _cs_open(cand):
+    """이 칸이 아직 안 끝났는가."""
+    if cand.count("(") > cand.count(")"):
+        return True
+    # ⚠️ '-' 한 글자는 빈 칸 표시지 이어지는 칸이 아니다.
+    #    이어붙이면 다음 클래스 코드까지 삼켜 'C'가 '-C'가 된다.
+    return cand.endswith("-") and len(cand) >= 3 and re.search(r"[가-힣]", cand)
+
+
+def merge_cells(lines):
+    """줄바꿈으로 쪼개진 표의 한 칸을 다시 붙인다."""
+    out, buf = [], ""
+    for raw in lines:
+        L = raw.strip()
+        if not L:
+            continue
+        # ★ 하이픈으로 **시작**하는 줄도 앞 칸의 꼬리다(흥국 형식):
+        #     '수수료선취' + '-오프라인(A)'
+        #     '수수료미징구' + '-오프라인' + '-퇴직연금(C)'
+        #   앞 칸이 하이픈으로 끝나는 경우(_cs_open)와 반대 방향이다.
+        if L.startswith("-") and len(L) > 1 and not buf and out and out[-1].startswith("수수료"):
+            out[-1] = out[-1] + L
+            if _cs_open(out[-1]):
+                buf = out.pop()
+            continue
+        # 괄호로 시작하는 짧은 줄은 앞 칸의 꼬리다: '무권유저비용' + '(C-G)'
+        if L.startswith("(") and not buf and out and len(L) <= 12:
+            out[-1] = out[-1] + L
+            continue
+        cand = (buf + L) if buf else L
+        if _cs_open(cand):
+            buf = cand
+            if len(buf) > 60:
+                out.append(buf)
+                buf = ""
+            continue
+        if buf:
+            out.append(cand)
+            buf = ""
+        else:
+            out.append(L)
+    if buf:
+        out.append(buf)
+    return out
+
+
+def classes_from_cellstream(lines):
+    """복원한 칸에서 (클래스, 설명) 목록을 뽑는다."""
+    found, pending = [], None
+    for c in merge_cells(lines):
+        s = c.replace(" ", "")
+        if _CS_STOP.match(s):
+            pending = None
+            continue
+        m = _CS_FRONT.match(s)
+        if m:
+            found.append((m.group(1), m.group(2)))
+            pending = None
+            continue
+        m = _CS_BACK.match(s)
+        if m:
+            found.append((m.group(2), m.group(1)))
+            pending = None
+            continue
+        m = _CS_BARE.match(s)
+        if m:
+            pending = m.group(1)
+            continue
+        if pending and _CS_DESC.match(s):
+            found.append((pending, s[:40]))
+            pending = None
+            continue
+        if len(s) > 3:
+            pending = None
+    uniq = []
+    for cls, desc in found:
+        c = normalize_class(cls) or cls
+        if c not in [x[0] for x in uniq]:
+            uniq.append((c, desc))
+    return uniq
+
+
 def extract(dump, sec, npages, fee_rows=None, pdf_path=None):
     pages = dump["pages"]
     rec = {"doc_id": dump["doc_id"], "fund_codes": dump["fund_codes"], "pages": npages}
@@ -339,7 +448,26 @@ def extract(dump, sec, npages, fee_rows=None, pdf_path=None):
             rec["위험등급_출처"] = "표지"
     rec["위험등급"], rec["위험라벨"] = g, label
     rec["등급산정기준"] = basis
+    # ★ VaR 문구는 요약정보·투자위험 밖에도 있다. 두 섹션은 73/92·76/92만 검출되고,
+    #   "…(97.5% VaR)은 52.95%로서 위험등급 6등급 중 1등급에 해당합니다" 같은
+    #   서술문이 위험등급 설명 문단(앞쪽 페이지)에 있는 문서가 많다.
+    #   ⚠️ 연혁에는 과거 등급·변동성이 섞여 있으므로 연혁 페이지는 제외한다.
+    # ★ VaR 서술문의 실제 위치는 11항 매입·환매 근처다(미검출 35건 중 30건).
+    #   "…(97.5% VaR)은 52.95%로서 위험등급 6등급 중 1등급에 해당합니다"
+    #   위험등급 산정 근거 문단이 11항 뒤에 붙는 형식이 많다. 중앙값 22p라
+    #   '앞 10페이지' 폴백으로는 1건밖에 못 잡았다.
+    #   ⚠️ 연혁은 과거 등급·변동성이 섞여 있어 제외한다.
     var = parse_var(summary) or parse_var(risk10)
+    if var is None:
+        var = parse_var(text_of(pages, span(sec, "11항매입환매", npages, 6)))
+    if var is None:
+        hist = sec.get("연혁")
+        for _p in pages:
+            if hist and _p["page"] == hist:
+                continue
+            var = parse_var(_p["text"])
+            if var is not None:
+                break
     rec["VaR_97.5"] = var
     gv = grade_from_var(var)
     rec["등급_VaR역산"] = gv
@@ -424,6 +552,24 @@ def extract(dump, sec, npages, fee_rows=None, pdf_path=None):
             coord = classes_from_coord(pdf_path, rng13)
             if len(coord) > len(uniq):
                 uniq = coord
+    # ★ 4차 폴백 — 칸 단위 세로 분해. 클래스가 **아예 없을 때만** 적용한다.
+    if not uniq:
+        rng13 = span(sec, "13항보수", npages, 8)
+        if rng13:
+            ls = text_of(pages, rng13).split("\n")
+            for i, l in enumerate(ls):        # ★ 13항 헤딩 뒤부터 (앞은 평가방법 표)
+                if re.match(r"^\s*13\s*[\.．]\s*보수", l):
+                    ls = ls[i + 1:]
+                    break
+            cs = classes_from_cellstream(ls)
+            # ★ 원문 대조 — 문서 전체에서 2회 미만 등장하는 코드는 버린다.
+            #   칸을 잘못 이어붙이면 'Ae' 'e' 'Cy' 같은 없는 코드가 만들어진다.
+            #   실제로 한 운용사 4개 문서가 똑같은 목록을 뱉었고 그중 절반이 0회였다.
+            whole = re.sub(r"\s+", "", "\n".join(p_["text"] for p_ in pages))
+            cs = [(c, d) for c, d in cs
+                  if whole.count(f"종류{c}") + whole.count(f"({c})") >= 2]
+            uniq = [{"class": c, "설명": d, "협회펀드코드": None, "출처": "13항셀"}
+                    for c, d in cs]
     rec["클래스"] = uniq
 
     # 연금 클래스 판정 — 설명의 '개인연금/퇴직연금'이 1순위, 클래스명은 보조
