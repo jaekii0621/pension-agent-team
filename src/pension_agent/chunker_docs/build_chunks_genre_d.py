@@ -9,7 +9,8 @@ import json
 from chunk_genre_d_schema import ChunkD
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR = "/mnt/user-data/uploads"  # 로컬에서는 data/raw로 바꿔서 쓰면 됨
+RAW_DIR = os.path.join(BASE_DIR, "..", "..", "..", "data", "raw")
+RAW_DIR = os.path.normpath(RAW_DIR)
 
 MIN_CHUNK_LEN = 300
 MAX_CHUNK_LEN = 800
@@ -222,7 +223,9 @@ if __name__ == "__main__":
         )
         all_chunks.append(c)
 
-    OUTPUT_PATH = os.path.join(BASE_DIR, "chunks_genre_d.jsonl")
+    OUTPUT_PATH = os.path.join(BASE_DIR, "..", "..", "..", "data", "chunks", "chunks_genre_d.jsonl")
+    OUTPUT_PATH = os.path.normpath(OUTPUT_PATH)
+        
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         for c in all_chunks:
             f.write(json.dumps(c.to_dict(), ensure_ascii=False) + "\n")

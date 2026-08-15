@@ -8,7 +8,8 @@ import json
 from chunk_genre_b_schema import ChunkB
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR = "/mnt/user-data/uploads"  # 로컬에서는 data/raw로 바꿔서 쓰면 됨
+RAW_DIR = os.path.join(BASE_DIR, "..", "..", "..", "data", "raw")
+RAW_DIR = os.path.normpath(RAW_DIR)
 
 DOC_IDS = ["doc20", "doc23", "doc25", "doc26", "doc36", "doc38", "doc39",
            "doc40", "doc41", "doc42", "doc43", "doc44", "doc45", "doc51", "doc52"]
@@ -101,12 +102,20 @@ def table_type(doc_id, table_idx):
 
 
 def calc_box_to_text(grid):
-    """계산식 강조박스를, 순서를 나타내는 기호(-, =)를 살려서 문장으로 풀어씀"""
+    """계산식 강조박스를, 순서를 나타내는 기호(-, =)를 살려서 문장으로 풀어씀.
+    반환: (표시용 text, 매칭용 raw_anchor, 매칭용 cell 리스트)
+    ⚠️ "(차감)", "→" 같은 연결어는 원문 PDF에 없으므로, 매칭용 값들은 그런
+    연결어 없이 셀 값 그대로(행 순서 보존)로 만든다.
+    """
     lines = []
+    raw_parts = []
+    cell_rows = []
     for row in grid:
         row = [c for c in row if c]
         if not row:
             continue
+        raw_parts.extend(row)
+        cell_rows.append(list(row))
         if len(row) == 1:
             lines.append(row[0])
         elif row[0] in ("-", "=", "+"):
@@ -114,24 +123,44 @@ def calc_box_to_text(grid):
             lines.append(f"({op}) {' '.join(row[1:])}")
         else:
             lines.append(" ".join(row))
-    return " → ".join(lines)
+    text = " → ".join(lines)
+    raw_anchor = " ".join(raw_parts)
+    return text, raw_anchor, cell_rows
 
 
 def normal_table_rows_to_texts(grid):
-    """일반 표: 헤더 행 기준으로, 데이터 행 하나당 문장 하나씩 생성"""
+    """일반 표: 헤더 행 기준으로, 데이터 행 하나당 문장 하나씩 생성.
+    반환: [(표시용 text, 매칭용 raw_anchor, 매칭용 cell 리스트), ...]
+
+    ⚠️ 수정 (페이지 매칭 버그 해결, 2차): text는 "헤더: 값" 형태로 재구성해서 사람이
+    읽기 좋게 만들지만, 이 형태는 원본 PDF엔 그대로 존재하지 않는다. raw_anchor
+    (레이블 없는 문자열)로 1차 개선했지만, 셀이 세로 병합된 표는 PDF 쪽 줄글 텍스트
+    추출 순서 자체가 뒤섞여서 문자열 매칭엔 한계가 있다 (doc42 실측).
+    cell_values(셀 값 리스트, docx가 파싱한 순서 그대로)를 별도로 반환하면,
+    fix_docx_pages.py가 PDF에서도 find_tables()로 표를 구조화해서 뽑은 뒤
+    "리스트 대 리스트"로 비교할 수 있다 — 장르A와 같은 방식이라 병합 셀에도 안전하다.
+    """
     if len(grid) < 2:
-        return [" / ".join(grid[0])] if grid else []
+        if not grid:
+            return []
+        text = " / ".join(grid[0])
+        raw_anchor = " ".join(c for c in grid[0] if c)
+        return [(text, raw_anchor, [c for c in grid[0] if c])]
     header, *data_rows = grid
-    texts = []
+    out = []
     for row in data_rows:
         pairs = []
+        raw_vals = []
         for h, v in zip(header, row):
             if not v:
                 continue
             pairs.append(f"{h}: {v}" if h else v)
+            raw_vals.append(v)
         if pairs:
-            texts.append(", ".join(pairs))
-    return texts
+            text = ", ".join(pairs)
+            raw_anchor = " ".join(raw_vals)
+            out.append((text, raw_anchor, raw_vals))
+    return out
 
 
 def looks_like_heading(text):
@@ -190,13 +219,12 @@ def process_doc(doc_id):
 
             if ttype == "calc_box":
                 flush_buffer()
-                text = calc_box_to_text(grid)
+                text, _raw_anchor, _cells = calc_box_to_text(grid)
                 if text:
                     chunks.append((text, "calc_box_text", buffer_heading))
             else:
                 flush_buffer()
-                row_texts = normal_table_rows_to_texts(grid)
-                for rt in row_texts:
+                for rt, _raw_anchor, _cells in normal_table_rows_to_texts(grid):
                     chunks.append((rt, "table_row", buffer_heading))
 
     flush_buffer()
@@ -222,7 +250,9 @@ if __name__ == "__main__":
             )
             all_chunks.append(c)
 
-    OUTPUT_PATH = os.path.join(BASE_DIR, "chunks_genre_b.jsonl")
+    OUTPUT_PATH = os.path.join(BASE_DIR, "..", "..", "..", "data", "chunks", "chunks_genre_d.jsonl")
+    OUTPUT_PATH = os.path.normpath(OUTPUT_PATH)    
+
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         for c in all_chunks:
             f.write(json.dumps(c.to_dict(), ensure_ascii=False) + "\n")
