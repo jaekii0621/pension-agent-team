@@ -52,6 +52,51 @@ def _returns(rec):
     return (_fmt_pct(f[0]) if f else NA), (_fmt_pct(b[0]) if b else NA)
 
 
+# ★ 과제 정의상 수익률 축은 "1년~3년"이다. 1년치만 쓰면 기간 비교 질의에 못 답한다.
+#   연평균수익률 표의 열 순서(원문 헤더로 확인):
+#     최근 1년 / 최근 2년 / 최근 3년 / 최근 5년 / 설정이후
+_PERIODS = ["1년", "2년", "3년", "5년", "설정이후"]
+
+
+def _returns_multi(rec):
+    """최근 1~3년 연평균수익률 한 줄. 값이 부족하면 있는 만큼만, 없으면 None."""
+    if rec.get("수익률_해당없음") or rec.get("수익률_수동확인필요"):
+        return None
+    f = rec.get("펀드수익률") or []
+    b = rec.get("비교지수수익률") or []
+    if len(f) < 2:
+        return None                      # 1년치뿐이면 위 줄과 중복이라 생략
+    parts = []
+    for i, lab in enumerate(_PERIODS[:3]):
+        if i >= len(f):
+            break
+        bi = f"(비교지수 {_fmt_pct(b[i])})" if i < len(b) else ""
+        parts.append(f"{lab} {_fmt_pct(f[i])}{bi}")
+    return "연평균 수익률: " + " / ".join(parts)
+
+
+# ★ 과제 정의상 수익률 축은 "1년~3년"이다. 카드에 1년치만 쓰면 비교 질의에 못 답한다.
+#   연평균수익률 표의 열 순서(확인 결과 기준). 값이 모자라면 있는 만큼만 쓴다.
+_PERIODS = ["1년", "2년", "3년", "5년", "설정이후"]
+
+
+def _returns_multi(rec):
+    """최근 1~3년 수익률을 한 줄로. 값이 없으면 None."""
+    if rec.get("수익률_해당없음") or rec.get("수익률_수동확인필요"):
+        return None
+    f = rec.get("펀드수익률") or []
+    b = rec.get("비교지수수익률") or []
+    if len(f) < 2:
+        return None
+    parts = []
+    for i, lab in enumerate(_PERIODS[:3]):
+        if i >= len(f):
+            break
+        bi = f" (비교지수 {_fmt_pct(b[i])})" if i < len(b) else ""
+        parts.append(f"{lab} {_fmt_pct(f[i])}{bi}")
+    return "연평균 수익률: " + " / ".join(parts)
+
+
 def _fee_line(rec):
     """
     클래스별 총보수. ⚠️ 보수_신뢰불가(클래스 매핑 미상)면 숫자를 쓰지 않는다.
@@ -114,6 +159,7 @@ def build_text(rec):
         _pension_line(rec),
         _fee_line(rec),
         f"최근 1년 수익률: {r1} (비교지수 {b1})",
+        _returns_multi(rec),
         f"비교지수: {rec.get('비교지수') or NA}",
         f"순자산(시장잔고): {_fmt_aum(rec.get('시장잔고_백만원'))}",
     ]
@@ -128,11 +174,32 @@ def build_text(rec):
         lines.append(f"매매회전율: {NA}")      # 빈 값은 생략하지 않고 명시
     if rec.get("작성기준일"):
         lines.append(f"작성기준일: {rec['작성기준일']}")
-    return "\n".join(lines)
+    # ★ 계약 §2-3: 수익률기준일은 "문서마다 다름. 비교 시 필수".
+    #   §4-1d에 '기준일 10개월 편차'가 expects_caveat 케이스로 등재돼 있다.
+    #   별도 필드가 없으면 작성기준일을 쓰되 그 사실을 밝힌다(추정으로 단정 금지).
+    base = rec.get("수익률기준일")
+    if base:
+        lines.append(f"수익률 기준일: {base}")
+    elif rec.get("작성기준일") and not rec.get("수익률_해당없음"):
+        lines.append(f"수익률 기준일: 작성기준일({rec['작성기준일']}) 기준으로 추정 "
+                     f"— 펀드마다 다를 수 있어 기간 비교 시 확인 필요")
+    return "\n".join(l for l in lines if l)   # ★ None 줄 제거
 
 
 def confidence_of(rec):
-    """카드 신뢰도 — 핵심 6축 중 몇 개가 채워졌는지."""
+    """
+    ★ 계약(INTERFACES.md §2-1): "confidence: OCR만. text는 1.0"
+
+    ⚠️ 예전엔 여기서 필드 충족도를 계산했다. 그런데 안내문서 코퍼스는 계약대로
+       상수(text=1.0 / ocr=0.95)를 쓰고 있어서, 같은 필드명이 두 코퍼스에서
+       전혀 다른 뜻이 된다. 검색 쪽에서 이 값으로 랭킹을 주면 어긋난다.
+       → 계약을 따르고, 충족도는 fill_ratio로 따로 낸다.
+    """
+    return 1.0
+
+
+def fill_ratio_of(rec):
+    """카드 충실도 — 핵심 축 중 몇 개가 채워졌는지. confidence와 별개 지표."""
     keys = ["fund_name", "위험등급", "상품분류", "시장잔고_백만원"]
     filled = sum(1 for k in keys if rec.get(k) is not None)
     base = 0.7 + 0.3 * (filled / len(keys))
@@ -162,7 +229,9 @@ def build(rec):
         "text": build_text(rec),
         "embed_text": build_text(rec),   # 300자대 — 절단 위험 없음. 스키마 통일용
         "parse_method": "manual" if rec.get("수작업보정") else "text",
-        "confidence": confidence_of(rec),
+        "confidence": confidence_of(rec),      # 계약: text=1.0
+        "fill_ratio": fill_ratio_of(rec),      # 충실도(자체 지표)
+        "table_ref": None,                     # 계약 §2-1. 펀드카드는 표 유래 아님
         # ── 조건부 ──
         "chunk_type": "fund_card",
         "근거페이지": {k: v["page"] for k, v in (rec.get("수작업근거") or {}).items()

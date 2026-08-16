@@ -24,26 +24,185 @@
 
 산출: data/chunks/section_chunks.jsonl
 """
-import os, re, sys, json
+import os, re, re, sys, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from parse.common import DUMP_DIR, TABLE_DIR, load_json, make_embed_text
+from parse.pass2_sections import HEADINGS, MAX_HEAD_LEN
 from parse.pass3_extract import span
 
 CHUNK_DIR = os.path.join(os.path.dirname(TABLE_DIR), "chunks")
 
 # (섹션키, span_max, 표시명)
+# ★ 계약 INTERFACES.md §1-3의 "✅ 포함/정본" 목록을 따른다.
+#   ⚠️ 카드에 값이 있다고 원문을 빼면 안 된다. 카드는 총보수만 담고 있어서
+#      "환매수수료 있나요?" 같은 질의에 답할 근거가 사라졌다(13항 누락).
 KEEP = [
+    ("요약정보",     4, "요약정보"),          # 계약 ✅ 포함 — OPTIONAL
+    ("제1부1항",     3, "제1부 클래스"),       # 계약 ✅ 정본 — 클래스 목록·협회코드
     ("투자대상",     5, "투자대상"),
     ("투자전략",     5, "투자전략"),
     ("투자위험",     5, "투자위험"),
     ("11항매입환매", 6, "매입·환매"),
+    ("13항보수",     8, "보수·수수료"),        # 계약 ✅ 정본 — 환매·판매수수료 원문
     ("별첨1",        4, "별첨1"),
+    ("제3부",        8, "재무·운용실적"),      # 계약 ✅ 포함 — 수익률 원문·기준일
+    ("제4부",        6, "관련회사"),           # 계약 ✅ 포함(1·3항) — OPTIONAL
 ]
+
+# 계약에 있으나 질의 세트에 대응 문항이 없고 청크만 2,060개 늘어나는 둘은
+# 기본적으로 뺀다. 필요해지면 이 집합을 비우면 된다.
+_OPTIONAL = {"요약정보", "제4부"}
+# ★ 요약정보·제4부도 계약 §1-3의 "✅ 포함" 항목이라 기본 포함으로 바꿨다.
+#   빼려면 SKIP_OPTIONAL=1 로 실행한다.
+if os.environ.get("SKIP_OPTIONAL") == "1":
+    KEEP = [k for k in KEEP if k[0] not in _OPTIONAL]
+
+# 계약이 ❌로 지정해 넣지 않는 것:
+#   연혁(과거 등급·보수 오염원) / 12항 기준가격산정 / 14항 과세(distractor) /
+#   제5부(법정 문구) / 엄브렐러 전환 대상 목록(다른 펀드 정보)
 
 MAX_LEN = 850            # 산문 조각 상한 (508토큰 ≈ 870자 실측 기준)
 TABLE_MAX = 600          # 표 조각 상한 — 숫자·구분자는 토큰을 더 먹는다
 MIN_LEN = 120
 
+
+
+# ===== 헤딩 오프셋 절단 =====================================================
+BOUNDARY_ONLY = {
+    "12항기준가격": [
+        r"^12\s*[\.．]\s*(?:집합투자증권의?\s*)?기준\s*가격",
+        r"^\d+\s*[\.．]\s*집합투자증권의?\s*기준가격\s*산정",
+        r"^\d+\s*[\.．]\s*기준가격\s*(?:의\s*)?산정",
+    ],
+    "엄브렐러전환": [
+        r"^\d+\s*[\.．]\s*전환\s*(?:형|가능)",
+        r"^전환\s*가능한?\s*집합투자기구",
+    ],
+}
+
+_ALL = {}
+for _k, _v in list(HEADINGS.items()) + list(BOUNDARY_ONLY.items()):
+    _ALL[_k] = [re.compile(p) for p in _v]
+
+STATS = {}
+
+
+def _iter_heading_lines(text):
+    pos = 0
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and len(s) <= MAX_HEAD_LEN:
+            yield pos, s
+        pos += len(line) + 1
+
+
+def heading_offset(text, key):
+    pats = _ALL.get(key)
+    if not pats or not text:
+        return None
+    for off, line in _iter_heading_lines(text):
+        if any(p.match(line) for p in pats):
+            return off
+    return None
+
+
+def next_boundary(by_page, start_pg, start_off, last_pg, self_key, toc):
+    best = None
+    for pg in range(start_pg, last_pg + 1):
+        if pg in toc:
+            continue
+        for off, line in _iter_heading_lines(by_page.get(pg) or ""):
+            if pg == start_pg and start_off is not None and off <= start_off:
+                continue
+            for key, pats in _ALL.items():
+                if key == self_key:
+                    continue
+                if any(p.match(line) for p in pats):
+                    if best is None or (pg, off) < best:
+                        best = (pg, off)
+                    break
+            if best and best[0] == pg:
+                break
+        if best:
+            break
+    return best if best else (last_pg, None)
+
+
+def page_slices(sec, key, npages, smax, by_page, toc):
+    rng = span(sec, key, npages, smax)
+    if not rng:
+        return []
+    a, b = rng
+    # 문서 앞머리 섹션은 헤딩 정규식이 본문 줄에 오탐하기 쉬워 페이지 처음부터 쓴다
+    HEAD_FROM_PAGE = {"요약정보"}
+    if key in HEAD_FROM_PAGE:
+        start_off = 0
+    else:
+        start_off = heading_offset(by_page.get(a) or "", key)
+    k = "head_ok" if start_off is not None else "head_miss"
+    STATS[k] = STATS.get(k, 0) + 1
+    if start_off is None:
+        STATS.setdefault("miss_keys", set()).add(key)
+        start_off = 0
+    end_pg, end_off = next_boundary(by_page, a, start_off, b, key, toc)
+    if end_off is not None:
+        STATS["tail_trimmed"] = STATS.get("tail_trimmed", 0) + 1
+    out = []
+    for pg in range(a, end_pg + 1):
+        if pg in toc:
+            continue
+        text = by_page.get(pg) or ""
+        if not text:
+            continue
+        s = start_off if pg == a else 0
+        e = end_off if (pg == end_pg and end_off is not None) else len(text)
+        piece = text[s:e].strip()
+        if piece:
+            out.append((pg, piece))
+    return out
+
+
+def _long_ratio(t):
+    ls = [l.strip() for l in (t or "").split("\n") if l.strip()]
+    return sum(1 for l in ls if len(l) > 40) / max(len(ls), 1)
+
+
+def resolve_sec(sec, by_page, toc):
+    """section_map에 없는 섹션을 페이지 직접 스캔으로 보충한다.
+    common.py는 건드리지 않으므로 pass2~5 결과에 영향이 없다."""
+    out = dict(sec)
+    for key, smax, label in KEEP:
+        if key in out:
+            continue
+        pats = _ALL.get(key) or []
+        for pg in sorted(by_page):
+            if pg == 1:
+                continue
+            text = by_page[pg]
+            if pg in toc and _long_ratio(text) <= 0.15:
+                continue          # 긴 문장 없는 진짜 목차만 건너뛴다
+            for off, line in _iter_heading_lines(text):
+                if any(p.match(line) for p in pats):
+                    out[key] = pg
+                    break
+            if key in out:
+                break
+    return out
+
+
+BLEED_KEYS = ["12항기준가격", "14항과세", "연혁", "제5부", "엄브렐러전환"]
+
+
+def check_bleed(chunks):
+    hit = {k: 0 for k in BLEED_KEYS}
+    for c in chunks:
+        for off, line in _iter_heading_lines(c.get("text") or ""):
+            for k in BLEED_KEYS:
+                if any(p.match(line) for p in _ALL.get(k, [])):
+                    hit[k] += 1
+                    break
+    return hit
+# ===========================================================================
 
 def is_table_block(text):
     """숫자·구분자가 많고 줄이 짧으면 표로 본다."""
@@ -182,21 +341,25 @@ def build(rec, smap_entry, pages):
     sec = smap_entry.get("sec", {})
     npages = smap_entry.get("pages", len(pages))
     by_page = {p["page"]: p["text"] for p in pages}
+    toc = {p for p in (smap_entry.get("toc") or [])
+           if _long_ratio(by_page.get(p, "")) <= 0.15}
+    sec = resolve_sec(sec, by_page, toc)
     out = []
     # ★ 섹션 카드가 #c001(펀드)·#c002(클래스)를 쓰므로 본문은 #c010부터
     seq = {}
 
     for key, smax, label in KEEP:
-        rng = span(sec, key, npages, smax)
-        if not rng:
-            continue
-        a, b = rng
-        for pg in range(a, b + 1):
-            txt = (by_page.get(pg) or "").strip()
+        for pg, txt in page_slices(sec, key, npages, smax, by_page, toc):
             if len(txt) < MIN_LEN:
                 continue
             for piece in split_page(txt):
                 if len(piece) < MIN_LEN:
+                    continue
+                # ★ 제1부 1항은 다음 섹션 헤딩이 없는 문서에서 3항(모집예정금액)·
+                #   5항(운용전문인력)까지 밀고 나간다. 계약이 지정한 건 "클래스 목록"뿐이라
+                #   협회코드나 종류 표기가 없는 조각은 버린다.
+                if key == "제1부1항" and not re.search(
+                        r"종류\s*[A-Za-z]|\(Class\)|펀드\s*코드|[A-Z]{1,2}\d{3,4}", piece):
                     continue
                 seq[pg] = seq.get(pg, 9) + 1
                 out.append({
@@ -208,7 +371,8 @@ def build(rec, smap_entry, pages):
                     "section": label,
                     "text": piece,
                     "parse_method": "text",
-                    "confidence": 1.0,
+                    "confidence": 1.0,          # 계약 §2-1
+                    "table_ref": None,
                     # ★ 인덱싱 입력. text는 인용용이라 자르지 않는다.
                     "embed_text": make_embed_text(
                         f"{rec.get('fund_name') or ''} · {label}", piece),
@@ -254,6 +418,10 @@ def main():
     print(f"  {MAX_LEN}자 초과 {sum(1 for x in lens if x > MAX_LEN)}개")
     print(f"  문서 {len({c['doc_id'] for c in out})}/92")
     print("\n섹션별:", dict(Counter(c["section"] for c in out)))
+    _miss = STATS.pop("miss_keys", set())
+    print("\n[절단 진단]", STATS, " 헤딩 미검출:", sorted(_miss) if _miss else "없음")
+    print("[배제 섹션 유입]", check_bleed(out), " <- 전부 0이어야 정상")
+
     print("\n--- 샘플 ---")
     print(out[0]["chunk_id"], "|", out[0]["section"])
     print(out[0]["text"][:400])

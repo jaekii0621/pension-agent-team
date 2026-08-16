@@ -401,6 +401,12 @@ def parse_method_of(rec):
 
 
 def confidence_of(rec):
+    """★ 계약(INTERFACES.md §2-1): text는 1.0. 좌표 재조립분만 낮춘다."""
+    return 0.95 if parse_method_of(rec) == "coord" else 1.0
+
+
+def fill_ratio_of(rec):
+    """클래스 중 총보수가 매핑된 비율. confidence와 별개 지표."""
     classes = rec.get("클래스") or []
     fees = _fee_map(rec)
     if not classes:
@@ -409,8 +415,6 @@ def confidence_of(rec):
     base = 0.6 + 0.4 * (filled / len(classes))
     if rec.get("보수_신뢰불가"):
         base -= 0.1
-    if parse_method_of(rec) == "coord":
-        base -= 0.05
     return round(max(0.5, min(base, 1.0)), 2)
 
 
@@ -435,7 +439,10 @@ def build(rec):
             f"{rec.get('fund_name') or rec['doc_id']} · 클래스별 보수·가입자격",
             txt, tail=tail),
         "parse_method": parse_method_of(rec),
-        "confidence": confidence_of(rec),
+        "confidence": confidence_of(rec),      # 계약: text=1.0 / coord=0.95
+        "fill_ratio": fill_ratio_of(rec),      # 총보수 매핑률(자체 지표)
+        # ★ 계약 §2-1 — 이 카드는 13항 보수표에서 재구성했다
+        "table_ref": f"{rec['doc_id']}#p{page}#t13항보수",
         # ── 조건부 ──
         "chunk_type": "class_card",
         "총보수_근거페이지": {c: p for c, p in _fee_pages(rec).items() if p} or None,
