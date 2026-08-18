@@ -144,8 +144,19 @@ def page_slices(sec, key, npages, smax, by_page, toc):
     if start_off is None:
         STATS.setdefault("miss_keys", set()).add(key)
         start_off = 0
-    end_pg, end_off = next_boundary(by_page, a, start_off, b, key, toc)
-    if end_off is not None:
+    # ★ patch24 — 경계 탐색만 span 밖으로 넓힌다.
+    #   span 의 smax 는 헤딩 미검출 시 폭주를 막는 안전장치인데, 그 상한이
+    #   next_boundary 의 시야까지 막아 다음 섹션 시작 페이지의 '헤딩 앞부분'
+    #   (= 이 섹션의 정당한 꼬리)이 통째로 버려졌다. VaR 20건이 이 경우다.
+    #   실제 헤딩을 찾은 경우에만 확장분을 쓰므로 폭주 위험은 없다.
+    LOOKAHEAD = 3
+    end_pg, end_off = next_boundary(
+        by_page, a, start_off, min(npages, b + LOOKAHEAD), key, toc)
+    if end_off is None:
+        end_pg, end_off = b, None          # 헤딩 미검출 → 기존 동작(smax 상한)
+    elif end_pg > b:
+        STATS["tail_recovered"] = STATS.get("tail_recovered", 0) + 1
+    else:
         STATS["tail_trimmed"] = STATS.get("tail_trimmed", 0) + 1
     out = []
     for pg in range(a, end_pg + 1):
