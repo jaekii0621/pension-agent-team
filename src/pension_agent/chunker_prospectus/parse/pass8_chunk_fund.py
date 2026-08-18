@@ -52,29 +52,6 @@ def _returns(rec):
     return (_fmt_pct(f[0]) if f else NA), (_fmt_pct(b[0]) if b else NA)
 
 
-# ★ 과제 정의상 수익률 축은 "1년~3년"이다. 1년치만 쓰면 기간 비교 질의에 못 답한다.
-#   연평균수익률 표의 열 순서(원문 헤더로 확인):
-#     최근 1년 / 최근 2년 / 최근 3년 / 최근 5년 / 설정이후
-_PERIODS = ["1년", "2년", "3년", "5년", "설정이후"]
-
-
-def _returns_multi(rec):
-    """최근 1~3년 연평균수익률 한 줄. 값이 부족하면 있는 만큼만, 없으면 None."""
-    if rec.get("수익률_해당없음") or rec.get("수익률_수동확인필요"):
-        return None
-    f = rec.get("펀드수익률") or []
-    b = rec.get("비교지수수익률") or []
-    if len(f) < 2:
-        return None                      # 1년치뿐이면 위 줄과 중복이라 생략
-    parts = []
-    for i, lab in enumerate(_PERIODS[:3]):
-        if i >= len(f):
-            break
-        bi = f"(비교지수 {_fmt_pct(b[i])})" if i < len(b) else ""
-        parts.append(f"{lab} {_fmt_pct(f[i])}{bi}")
-    return "연평균 수익률: " + " / ".join(parts)
-
-
 # ★ 과제 정의상 수익률 축은 "1년~3년"이다. 카드에 1년치만 쓰면 비교 질의에 못 답한다.
 #   연평균수익률 표의 열 순서(확인 결과 기준). 값이 모자라면 있는 만큼만 쓴다.
 _PERIODS = ["1년", "2년", "3년", "5년", "설정이후"]
@@ -164,13 +141,17 @@ def build_text(rec):
         f"순자산(시장잔고): {_fmt_aum(rec.get('시장잔고_백만원'))}",
     ]
     to = rec.get("매매회전율")
-    # ⚠️ 주식형인데 회전율 0은 파싱 오류일 가능성이 있다 → 카드에 넣지 않는다.
-    #    채권형의 0은 정상이지만 굳이 인용될 값이 아니다.
+    # ★ 0은 파싱 오류가 아니라 원문에 명시된 값이다(dump 전수 대조, 43건).
+    #   매매회전율은 정의상 '주식' 매매 지표라 채권형의 0은 정상이고,
+    #   "회전율 얼마예요?" 질의에 답하려면 카드에 있어야 한다.
     if rec.get("매매회전율_해당없음"):
         lines.append("매매회전율: 해당없음(주식 매매 지표 없음)")
-    elif isinstance(to, (int, float)) and to > 0:
-        lines.append(f"매매회전율: {to:g}%")
-    elif to is None:
+    elif isinstance(to, (int, float)):
+        if to == 0:
+            lines.append("매매회전율: 0% (해당 기간 주식 매매 없음)")
+        else:
+            lines.append(f"매매회전율: {to:g}%")
+    else:
         lines.append(f"매매회전율: {NA}")      # 빈 값은 생략하지 않고 명시
     if rec.get("작성기준일"):
         lines.append(f"작성기준일: {rec['작성기준일']}")
