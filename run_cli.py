@@ -16,6 +16,7 @@ import json
 import sys
 
 import config
+import utils  # noqa: F401  — import 시점에 stdout 을 UTF-8 로 고정한다(Windows cp949 대비)
 
 
 # ==========================================================================
@@ -52,7 +53,10 @@ def cmd_check() -> int:
             print(f"    펀드 수     : {s['funds']}개 (질의분석 프롬프트에 주입)")
             print(f"    distractor  : {s['distractor']}건 (검색 시 감점)")
             print(f"    표 청크     : {s['table_chunks']}건 (계산·사실조회 가산)")
-            print(f"    저신뢰 파싱 : {s['low_confidence']}건 (confidence<0.8, 감점)")
+            print(f"    사유별      : {s['by_사유']} (중도인출 소프트필터)")
+            print(f"    페이지 추정 : {s['page_unverified']}건 (인용 시 근사치 표시)")
+            print(f"    OCR 파싱    : {s['ocr_chunks']}건 "
+                  f"(confidence=0.95 — 상수라 감점하지 않는다)")
         except Exception as e:
             print(f"    ✗ 코퍼스 로딩 실패: {e}")
             ok = False
@@ -78,15 +82,36 @@ def cmd_check() -> int:
     print(f"    접두사      : 질의='{config.EMBED_QUERY_PREFIX}' "
           f"문서='{config.EMBED_PASSAGE_PREFIX}'")
     print(f"    하이브리드  : BM25 {config.BM25_WEIGHT} : 벡터 {config.VEC_WEIGHT}")
-    vec = config.CACHE_DIR / f"vectors_{config.EMBED_SLUG}.npy"
-    print(f"    벡터 캐시   : {'있음' if vec.exists() else '없음 → BM25 단독 (python -m index.build_index)'}")
 
-    # 5. 웹 검색
-    print(f"\n[5] 네이버 웹 검색 폴백")
-    print(f"    키          : {'설정됨' if config.NAVER_CLIENT_ID else '✗ 없음 (폴백 비활성)'}")
+    # ── 벡터 아티팩트 (빌드 단계 산출물) ────────────────────────────
+    from index import artifact
+    info = artifact.describe()
+    if not info["exists"]:
+        print(f"    벡터 아티팩트: ✗ 없음 → `python -m index.build_index`")
+        print(f"                  경로: {info['path']}")
+        if config.REQUIRE_VECTORS:
+            print(f"                  ⚠️ REQUIRE_VECTORS=True 라 실행이 실패합니다")
+            ok = False
+    else:
+        print(f"    벡터 아티팩트: {info['n_vectors']}건 × {info['embed_dim']}차원, "
+              f"{info['size_mb']}MB (빌드 {info['built_at']})")
+        try:
+            from index import load_corpus, searchable_text
+            chunks = load_corpus()
+            fp = artifact.corpus_fingerprint(
+                [c["chunk_id"] for c in chunks],
+                [searchable_text(c) for c in chunks])
+            if fp == info.get("fingerprint"):
+                print(f"                  ✓ 현재 코퍼스와 일치")
+            else:
+                print(f"                  ✗ 코퍼스와 불일치 → "
+                      f"`python -m index.build_index` 필요")
+                ok = False
+        except Exception as e:
+            print(f"                  지문 확인 실패: {e}")
 
-    # 6. 워크플로 스위치
-    print(f"\n[6] 활성 구성요소")
+    # 5. 워크플로 스위치
+    print(f"\n[5] 활성 구성요소")
     on = [k for k, v in config.WORKFLOW_SETTINGS.items() if v]
     off = [k for k, v in config.WORKFLOW_SETTINGS.items() if not v]
     print(f"    ON : {', '.join(on)}")
@@ -98,16 +123,24 @@ def cmd_check() -> int:
         try:
             from index import get_index
             idx = get_index()
-            for q, f in [("IRP 중도인출 사유", {"scope": "doc"}),
-                         ("주택구입 중도인출 서류", {"scope": "doc"}),
-                         ("퇴직연금 적립금 위험자산 투자한도", {"scope": "doc"}),
-                         ("퇴직연금 IRP 가입 가능한 채권형 펀드", {"scope": "all"})]:
-                hits = idx.search(q, top_k=3, filters=f)
-                print(f"    '{q}' (scope={f['scope']}) → {len(hits)}건")
+            L = config.PRODUCT_INTENT_LEVELS
+            for q, f in [
+                ("IRP 중도인출 사유", {"product_affinity": L["제도"]}),
+                ("주택구입 중도인출 서류",
+                 {"product_affinity": L["제도"], "사유": ["주택구입"]}),
+                ("퇴직연금 적립금 위험자산 투자한도", {"product_affinity": L["제도"]}),
+                ("퇴직연금 IRP 가입 가능한 채권형 펀드", {"product_affinity": L["상품"]}),
+                ("세액공제 한도와 담을 채권형 펀드", {"product_affinity": L["혼합"]}),
+            ]:
+                hits = idx.search(q, top_k=4, filters=f)
+                nd = sum(1 for h in hits if h["chunk"]["tier"] == "doc")
+                print(f"    '{q}' (관여도={f['product_affinity']:.2f}"
+                      f"{', 사유=' + str(f['사유']) if f.get('사유') else ''}) → "
+                      f"{len(hits)}건 [규정 {nd} / 상품 {len(hits) - nd}]")
                 for h in hits[:2]:
                     c = h["chunk"]
-                    print(f"        {h['score']:.3f} {c['chunk_id']:24s} "
-                          f"{(c.get('section') or c['text'])[:38]}")
+                    print(f"        {h['score']:.3f} {c['chunk_id']:26s} "
+                          f"{(c.get('section') or c['text'])[:36]}")
         except Exception as e:
             print(f"    ✗ 검색 실패: {e}")
             ok = False
@@ -120,15 +153,11 @@ def cmd_check() -> int:
 # ==========================================================================
 def ask(question: str, profile: dict, *, show_mermaid: bool = False,
         show_json: bool = False) -> None:
-    from llm import dry_run_banner
     from utils import render_mermaid, render_trace
     from workflows import run
 
     print("\n" + "=" * 68)
     print(f"질문: {question}")
-    banner = dry_run_banner()
-    if banner:
-        print(banner)
     print("=" * 68)
 
     result = run(question, user_profile=profile)
@@ -147,31 +176,25 @@ def ask(question: str, profile: dict, *, show_mermaid: bool = False,
     # usage_for() 는 "ms", usage_summary() 는 "total_ms" 로 준다.
     ms = u.get("ms", u.get("total_ms", 0))
 
-    if u.get("mode") == "dry-run":
-        # 토큰 0 을 그냥 찍으면 "왜 0이지?" 로 읽힌다. 이유를 함께 쓴다.
-        print(f"토큰 측정 불가 — 드라이런이라 CLOVA 를 호출하지 않았습니다 "
-              f"(노드 실행 {u.get('calls', 0)}회).")
-        print("  실제 토큰을 재려면 CLOVA_API_KEY 를 설정하고 다시 실행하세요.")
-    else:
-        print(f"질문 1건 토큰: 총 {total:,}  "
-              f"(입력 {u.get('in_tokens', 0):,} + 출력 {u.get('out_tokens', 0):,})  |  "
-              f"LLM 호출 {u.get('calls', 0)}회  |  {ms / 1000:.1f}초")
-        if u.get("precounted_in_tokens"):
-            print(f"    ※ Tokenizer API 사전계산 입력 토큰: "
-                  f"{u['precounted_in_tokens']:,}")
+    print(f"질문 1건 토큰: 총 {total:,}  "
+          f"(입력 {u.get('in_tokens', 0):,} + 출력 {u.get('out_tokens', 0):,})  |  "
+          f"LLM 호출 {u.get('calls', 0)}회  |  {ms / 1000:.1f}초")
+    if u.get("precounted_in_tokens"):
+        print(f"    ※ Tokenizer API 사전계산 입력 토큰: "
+              f"{u['precounted_in_tokens']:,}")
 
-        if u.get("by_model"):
-            print("  모델별")
-            for m, d in sorted(u["by_model"].items(), key=lambda x: -x[1]["total"]):
-                share = 100 * d["total"] / total if total else 0
-                print(f"    {m:16s} {d['n']:>2}회  {d['total']:>7,} 토큰 ({share:4.1f}%)  "
-                      f"{d['ms']:>6}ms")
+    if u.get("by_model"):
+        print("  모델별")
+        for m, d in sorted(u["by_model"].items(), key=lambda x: -x[1]["total"]):
+            share = 100 * d["total"] / total if total else 0
+            print(f"    {m:16s} {d['n']:>2}회  {d['total']:>7,} 토큰 ({share:4.1f}%)  "
+                  f"{d['ms']:>6}ms")
 
-        if u.get("by_stage"):
-            print("  단계별")
-            for stage, d in sorted(u["by_stage"].items(), key=lambda x: -x[1]["total"]):
-                print(f"    {stage:22s} {d['n']:>2}회  {d['ms']:>6}ms  "
-                      f"in={d['in']:>6} out={d['out']:>5} total={d['total']:>6}")
+    if u.get("by_stage"):
+        print("  단계별")
+        for stage, d in sorted(u["by_stage"].items(), key=lambda x: -x[1]["total"]):
+            print(f"    {stage:22s} {d['n']:>2}회  {d['ms']:>6}ms  "
+                  f"in={d['in']:>6} out={d['out']:>5} total={d['total']:>6}")
 
     if show_mermaid:
         print("\n[mermaid]\n" + render_mermaid(result.get("trace", [])))
@@ -186,6 +209,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="연금 에이전트 CLI")
     ap.add_argument("question", nargs="?", help="질문 (생략 시 대화형)")
     ap.add_argument("--check", action="store_true", help="설정·데이터 점검")
+    ap.add_argument("--queryset", action="store_true",
+                    help="자체 평가 질의 세트 78문항을 돌리고 분석용 기록을 남긴다 "
+                         "(세부 옵션은 `python -m eval.run_queryset --help`)")
     ap.add_argument("--mermaid", action="store_true", help="실행 경로 mermaid 출력")
     ap.add_argument("--json", action="store_true", help="최종 state 출력")
     ap.add_argument("--profile", default="", help='사용자 정보 JSON (예: \'{"age":57}\')')
@@ -193,6 +219,12 @@ def main() -> int:
 
     if a.check:
         return cmd_check()
+
+    if a.queryset:
+        # 세부 옵션(--track/--section/--limit 등)이 필요하면 모듈을 직접 부른다.
+        from eval.run_queryset import main as qs_main
+        sys.argv = [sys.argv[0]]
+        return qs_main()
 
     profile = {}
     if a.profile:

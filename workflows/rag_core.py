@@ -5,13 +5,13 @@
 
       검색 → 채점 → [분기] → 생성 → 검증 → [분기] → 끝
                       ↓ 부족               ↓ 실패
-                   재작성 → 재검색       재생성 / 재검색 / 웹검색
+                   재작성 → 재검색       재생성 / 재검색 / 포기
 
 ■ 이게 왜 'Agentic RAG' 인가
   일반 RAG:  검색 → 생성 → 끝.  검색이 실패해도 그냥 답을 만든다(= 환각).
   이 파이프라인은 **검문소 2개**(문서 채점, 답변 검증)를 두고,
   실패하면 스스로 질문을 고쳐 되돌아간다. 그리고 각 검문소마다
-  재시도 한도가 있어서, 넘으면 웹 검색으로 탈출한다.
+  재시도 한도가 있어서, 넘으면 근거 없이 "확인되지 않습니다" 로 끝낸다.
   "실패를 감지하고 다른 방법을 시도한다" — 이것이 에이전트다.
 
 ■ config 로 그래프 모양이 바뀐다 (선행모델과 같은 기법)
@@ -43,12 +43,6 @@ if config.WORKFLOW_SETTINGS["grade_documents"]:
 if config.WORKFLOW_SETTINGS["check_hallucination"] or config.WORKFLOW_SETTINGS["grade_answer"]:
     graph.add_node("verify", nodes.verify_answer)
 
-if config.WORKFLOW_SETTINGS["web_search_fallback"]:
-    graph.add_node("web_search", nodes.search_web)
-    graph.add_node("web_answer", nodes.generate_web_answer)
-    graph.add_edge("web_search", "web_answer")
-    graph.add_edge("web_answer", END)
-
 # ── 흐름 연결 ─────────────────────────────────────────────────────────
 #
 # 선행모델(FinSight)은 rag_e2e 의 첫 노드가 extract_metadata 였다 — 분해 후
@@ -64,8 +58,6 @@ if config.WORKFLOW_SETTINGS["web_search_fallback"]:
 # → 서브질문 1개당 LLM 호출이 1회 줄었다.
 graph.add_edge(START, "retrieve")
 
-_web_target = "web_search" if config.WORKFLOW_SETTINGS["web_search_fallback"] else END
-
 if config.WORKFLOW_SETTINGS["grade_documents"]:
     graph.add_edge("retrieve", "grade")
 
@@ -76,8 +68,11 @@ if config.WORKFLOW_SETTINGS["grade_documents"]:
             {
                 "enough": "generate",
                 "rewrite": "rewrite",
-                "web": _web_target,
-                "give_up": "generate",     # 근거 없이도 '확인 불가' 응답은 내야 한다
+                # 재시도를 소진해도 답변은 낸다 — 근거 없이 '확인되지 않습니다'.
+                # 웹 검색 폴백은 제거했다(2026-08-22). 근거를 chunk_id 로 채점하는
+                # 구조에서 웹 근거는 채점 대상이 될 수 없고, 검증되지 않은 외부
+                # 문서를 금액·기한의 근거로 쓰는 것은 응답 정책과 충돌한다.
+                "give_up": "generate",
             },
         )
     else:

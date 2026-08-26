@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "fingerprint": "f99338520950b53b0b6562fb0e663e30903d3de2",
+  "embed_model": "intfloat/multilingual-e5-large",
+  "embed_dim": 1024,
+  "passage_prefix": "passage: ",
+  "query_prefix": "query: ",
+  "max_seq": 512,
+  "n_vectors": 9077,
+  "n_chunks": 9077,
+  "normalized": true,
+  "dtype": "float16",
+  "built_at": "2026-08-23T11:28:50"
+}

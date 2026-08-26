@@ -125,7 +125,17 @@ class E5Embedder:
         self._mem: dict[str, List[float]] = {}
         self._model = None                 # 지연 로딩 (모델 로드가 수 초 걸린다)
         self._load_failed = False
-        self._load_cache()
+        self._cache_loaded = False         # 디스크 캐시는 **빌드 단계에서만** 올린다
+
+    # ------------------------------------------------------------ 단계 분리
+    #
+    # 문서 캐시(emb_*.jsonl)를 생성자에서 통째로 올리던 것을 지연 로딩으로 바꿨다.
+    #
+    #   예전: 프로세스가 뜰 때마다 7,939건을 파이썬 리스트 dict 으로 메모리에 적재
+    #         (수백 MB). 정작 서빙 단계는 이 캐시를 한 번도 안 쓴다 — 검색은 빌드
+    #         단계가 만든 .npy 행렬만 보기 때문이다.
+    #   지금: `embed_passages()`(빌드 단계)가 처음 불릴 때만 올린다.
+    #         질의 임베딩은 프로세스 안 메모리 캐시만 쓰고 디스크를 건드리지 않는다.
 
     # ---------------------------------------------------------------- 모델
     @property
@@ -188,6 +198,10 @@ class E5Embedder:
         return self.cache_dir / f"emb_{config.EMBED_SLUG}.jsonl"
 
     def _load_cache(self) -> None:
+        """디스크 캐시를 메모리로 올린다. **빌드 단계에서만** 호출된다."""
+        if self._cache_loaded:
+            return
+        self._cache_loaded = True
         f = self._cache_file
         if not f.exists():
             return
@@ -216,11 +230,22 @@ class E5Embedder:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     # ---------------------------------------------------------------- 계산
-    def _encode(self, prefixed: List[str]) -> List[List[float]]:
-        """캐시를 거쳐 배치 인코딩한다. 입력은 **접두사가 이미 붙은** 문자열."""
+    def _encode(self, prefixed: List[str], *,
+                use_disk_cache: bool) -> List[List[float]]:
+        """배치 인코딩한다. 입력은 **접두사가 이미 붙은** 문자열.
+
+        `use_disk_cache` 가 두 단계를 가른다.
+          True  (빌드) : 디스크 캐시를 읽고 새로 계산한 것을 덧붙인다.
+                         청크 몇 개만 바뀌었을 때 그것만 다시 계산하기 위한 것.
+          False (서빙) : 프로세스 안 메모리 캐시만 쓴다. 질의는 매번 다르고
+                         재사용되지 않아서, 디스크에 쌓아 봐야 파일만 커진다.
+        """
         model = self._ensure_model()
         if model is None:
             raise EmbeddingError("임베딩 모델을 사용할 수 없습니다.")
+
+        if use_disk_cache:
+            self._load_cache()
 
         hashes = [self._hash(t) for t in prefixed]
         todo_idx = [i for i, h in enumerate(hashes) if h not in self._mem]
@@ -239,34 +264,41 @@ class E5Embedder:
                 lst = [float(x) for x in v]
                 self._mem[hashes[i]] = lst
                 fresh.append((hashes[i], lst))
-            self._append_cache(fresh)
+            if use_disk_cache:
+                self._append_cache(fresh)
 
         return [self._mem[h] for h in hashes]
 
     # ---------------------------------------------------------------- 공개
     def embed_query(self, text: str) -> Optional[List[float]]:
-        """질의 임베딩. `query: ` 접두사를 붙인다."""
+        """[서빙] 질의 임베딩. `query: ` 접두사를 붙인다.
+
+        서빙 단계에서 모델이 필요한 곳은 **여기 하나뿐이다.** 문서는 빌드 단계가
+        이미 인코딩해 아티팩트로 저장해 뒀다.
+        """
         if not self.enabled:
             return None
         text = (text or "").strip()
         if not text:
             return None
         try:
-            return self._encode([config.EMBED_QUERY_PREFIX + text])[0]
+            return self._encode([config.EMBED_QUERY_PREFIX + text],
+                                use_disk_cache=False)[0]
         except Exception as e:
             log.warning("질의 임베딩 실패(%s) → BM25 단독", e)
             return None
 
     def embed_passages(self, texts: List[str], *,
                        progress: bool = True) -> Optional["np.ndarray"]:
-        """문서 임베딩. `passage: ` 접두사를 붙인다. (N, dim) 행렬을 돌려준다."""
+        """[빌드] 문서 임베딩. `passage: ` 접두사를 붙인다. (N, dim) 행렬."""
         if not self.enabled or np is None:
             return None
         prefixed = [config.EMBED_PASSAGE_PREFIX + (t or "").strip() for t in texts]
         try:
             if progress:
                 print(f"  임베딩 {len(prefixed)}건 (모델={self.model_name})")
-            return np.array(self._encode(prefixed), dtype="float32")
+            return np.array(self._encode(prefixed, use_disk_cache=True),
+                            dtype="float32")
         except Exception as e:
             log.warning("문서 임베딩 실패: %s", e)
             return None

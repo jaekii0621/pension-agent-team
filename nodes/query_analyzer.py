@@ -43,16 +43,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from pydantic import BaseModel, Field
 
 import config
-from index import fund_names
+from index import fund_names, match_known_fund, product_signal
 from llm import llm
 from prompt import prompts
 from state import OverallState
 from utils import Timer, step
+
+log = logging.getLogger(__name__)
 
 
 class QueryAnalysis(BaseModel):
@@ -108,9 +111,58 @@ def analyze_query(state: OverallState) -> dict:
     clean = _sanitize(res, known)
     qt = clean["질문유형"]
 
-    # 전역 필터는 기본 scope 만 담는다. 서브질문마다 분해기가 덮어쓴다.
+    # ── 펀드명 2중 확보: LLM 추출 + 목록 대조 (2026-08-18 보강) ──────────
+    #
+    # ★ 여기가 P-F4·P-G0a·P-G0b 실패의 수정 지점이다.
+    #
+    # 예전에는 펀드명 추출을 **LLM 에게만** 맡겼다. 그런데 HCX-DASH-002 가
+    # 세 문항에서 이걸 놓쳤다 — 셋 다 질문에 펀드명이 그대로 적혀 있었는데도다.
+    #
+    #     "미래에셋장기성장포커스 중간에 깨면 환매수수료 물어야 하나요?"  (P-F4)
+    #     "미래에셋장기성장포커스 운용사가 … 같은 계열인가요?"            (P-G0a)
+    #     "미래에셋장기성장포커스에 넣은 돈은 어디에 보관되나요?"          (P-G0b)
+    #
+    # 놓치면 fund_name 이 빈 배열이 되고, 관여도가 기본값 0.35 에 머문다.
+    # 0.35 면 투자설명서가 top-k 8칸 중 3칸만 받는다. 답이 있는 섹션 원문에
+    # 구조적으로 도달할 수 없다 — 검색 이전에 여기서 이미 진 것이다.
+    #
+    # 안전검사 노드는 같은 판단을 **목록 대조**로 하고 있었고 세 문항 모두 잡았다.
+    # 그 함수를 index 계층으로 올려 여기서도 쓴다. 문자열 비교라 오탐이 없고
+    # LLM 호출도 0회다. LLM 이 잡으면 그대로 쓰고, 놓치면 이쪽이 받친다.
+    fund_from_list = False
+    if not clean["fund_name"]:
+        hit = match_known_fund(question)
+        if hit:
+            clean["fund_name"] = [hit]
+            fund_from_list = True
+            log.info("LLM 이 놓친 펀드명을 목록 대조로 확보: %s", hit[:30])
+
+    # 전역 필터는 기본값만 담는다. 서브질문마다 분해기가 덮어쓴다.
+    #
+    # product_affinity 는 **하드 필터가 아니라 자리 배분값**이다(config 참고).
+    # 펀드명이 지목됐다면 그 자체가 "상품 정보가 필요하다"는 확정 신호이므로
+    # 관여도를 올린다 — 이건 LLM 판정이 아니라 목록 대조로 확정된 값이라 안전하다.
+    is_product, product_ratio = product_signal(question)
+    if clean["fund_name"]:
+        affinity = config.PRODUCT_INTENT_LEVELS["상품"]
+    elif qt == "추천":
+        affinity = config.PRODUCT_INTENT_LEVELS["상품"]
+    elif is_product:
+        # 펀드 이름은 없지만 **상품 어휘**로 확정되는 질문 (2026-08-20).
+        #
+        #   판정은 코퍼스에 직접 묻는다 — 투자설명서 BM25 가 규정문서 BM25 보다
+        #   높으면 상품 질문으로 본다(index.product_signal 주석 참고).
+        #   실측에서 제도 문항을 상품으로 오판한 건이 0건이라 올리는 방향으로 안전하다.
+        #
+        #   '상품'(0.85) 이 아니라 '혼합'(0.50) 을 쓴다. 비율 신호는 펀드명 대조만큼
+        #   확정적이지 않고, 이 부류는 제도 설명이 함께 필요한 전제교정 질문이 많다.
+        #   양쪽에 자리를 나눠 주는 편이 안전하다.
+        affinity = config.PRODUCT_INTENT_LEVELS["혼합"]
+    else:
+        affinity = config.DEFAULT_PRODUCT_INTENT
+
     filters = {
-        "scope": "all" if qt == "추천" else config.DEFAULT_SCOPE,
+        "product_affinity": affinity,
         "fund_name": clean["fund_name"],
     }
 
@@ -121,8 +173,11 @@ def analyze_query(state: OverallState) -> dict:
         "llm_calls": 1,
         "trace": step(
             "analyze_query",
-            summary=f"질문유형={qt}, scope={filters['scope']}"
-                    + (f", 펀드={filters['fund_name']}" if filters["fund_name"] else ""),
+            summary=f"질문유형={qt}, 상품관여도={affinity:.2f}"
+                    + (f", 펀드={filters['fund_name']}" if filters["fund_name"] else "")
+                    + (", 펀드명=목록대조로 확보" if fund_from_list else "")
+                    + (f", 상품신호 비율={product_ratio:.2f}"
+                       if (is_product and not clean["fund_name"]) else ""),
             detail=filters,
             ms=t.ms,
         ),

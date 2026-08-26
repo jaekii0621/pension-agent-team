@@ -50,17 +50,20 @@ python run_cli.py "IRP 중도인출 사유가 뭔가요?"
 python -m eval.runner --retrieval-only         # 검색 성능만 (LLM 호출 0회)
 ```
 
-### API 키가 아직 없을 때 — 드라이런
+### API 키가 아직 없을 때
 
-`CLOVA_API_KEY` 가 비어 있으면 자동으로 **드라이런 모드**로 돈다 (`llm/offline.py`).
-LLM 이 할 판단을 규칙으로 대신해서 다음을 무료로 검증한다.
+키 없이 확인할 수 있는 것과 없는 것이 갈린다. **드라이런(대역 LLM)은 제거했다** —
+LLM 없이 만든 답변은 품질을 대변하지 못하는데 기록 파일에는 실제 실행과 똑같은
+모양으로 남아서, 나중에 섞이면 구분할 방법이 없기 때문이다.
 
-- 노드 연결·분기가 의도대로 도는가
-- `Send` 병렬 fan-out 과 리듀서 병합이 맞는가
-- 검색 필터·소스 가중치·인용 번호 재매핑이 맞는가
-- 재시도 한도가 무한루프를 막는가
+키 없이 되는 것:
 
-검증할 수 **없는** 것: 답변 품질. 그건 실제 키로만 측정한다.
+```bash
+python run_cli.py --check
+```
+
+코퍼스 로딩, 벡터 아티팩트 상태, 검색 단독 동작까지 확인된다.
+파이프라인 실행(`run_cli.py "질문"`, `eval.run_queryset`)에는 키가 필요하다.
 
 ### 키를 받은 뒤
 
@@ -85,13 +88,13 @@ pension_agent/
 │
 ├── llm/                    CLOVA Studio 호출 통로
 │   ├── clova_client.py     Chat Completions + 구조화 출력
-│   ├── embeddings.py       clir-sts-dolphin + 디스크 캐시
-│   └── offline.py          드라이런
+│   └── embeddings.py       multilingual-e5-large (질의 인코딩 + 빌드 캐시)
 │
 ├── index/                  검색 계층 (인메모리)
 │   ├── loader.py           JSONL → 통일 스키마 + 태그 파생
-│   ├── store.py            하이브리드 검색 + 필터 + 소스 신뢰도
-│   └── build_index.py      임베딩 사전 계산
+│   ├── store.py            [서빙] 하이브리드 검색 + 계층 쿼터 + 가중
+│   ├── artifact.py         벡터 아티팩트 저장/로드 + 지문 검증
+│   └── build_index.py      [빌드] 코퍼스 → 벡터 아티팩트
 │
 ├── nodes/                  에이전트(작업대) 14개
 ├── edges/                  분기 함수 6개
@@ -101,7 +104,7 @@ pension_agent/
 │
 ├── eval/                ★ 성능 측정 (현 단계의 목적)
 │   ├── metrics.py          검색·정확도·비용 지표
-│   ├── goldset.jsonl       실제 chunk_id 기반 정답셋 12건
+│   ├── gold/                골드셋 (policy.jsonl / product.jsonl)
 │   └── runner.py           실행기
 │
 ├── data/tax_tables.json    세율표 (코드가 읽음, LLM 아님)

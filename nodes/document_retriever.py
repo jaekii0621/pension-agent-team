@@ -48,19 +48,28 @@ from llm import embedder
 from state import RAGState
 from utils import Timer, log_message, step, truncate
 
-# 완화 순서 — scope 를 넓히는 것이 전부다.
-#   level 0 : 서브질문이 정한 scope 그대로
-#   level 1 : scope="all" (투자설명서까지 개방)
-#   level 2 : fund_name 까지 해제
-#   level -1: 필터 전면 해제 (선행모델의 무필터 재검색에 대응)
-RELAX_STEPS = ["scope", "fund_name"]
+# 완화 순서 — **소프트 필터를 순서대로 푼다.**
+#
+#   level 0 : 서브질문이 정한 조건 그대로 (사유 + 펀드명)
+#   level 1 : 사유 해제      ← 사유 추정이 빗나갔거나 장르C 밖에 답이 있는 경우
+#   level 2 : 펀드명까지 해제
+#   level -1: 전면 해제 (선행모델의 무필터 재검색에 대응)
+#
+# ★ 코퍼스(tier)는 완화 대상이 아니다. 애초에 좁힌 적이 없기 때문이다 —
+#   규정문서/투자설명서 배분은 계층 쿼터가 top-k 안에서 처리한다(store.py).
+#   그래서 "추천 판정이 틀려서 정답 코퍼스를 통째로 못 봤다" 는 실패 자체가 없다.
+#
+# 사유를 **하드 필터가 아니라 완화 사다리 0단계**에 둔 것이 핵심이다.
+# 예전 8축 태그 필터가 망한 이유는 필터 자체가 아니라 **완화가 안 돌아서**였다
+# (`if hits: break` — 1건만 나와도 멈췄다). 사유는 결과가 모자라면 자동으로 풀린다.
+RELAX_STEPS = ["사유", "fund_name"]
 
 
 def _relax(filters: Dict[str, Any], level: int) -> Dict[str, Any]:
     """level 단계만큼 조건을 푼다. level=0 이면 원본 그대로."""
     f = deepcopy(filters or {})
     if level >= 1:
-        f["scope"] = "all"
+        f.pop("사유", None)
     if level >= 2:
         f["fund_name"] = []
     return f
@@ -69,11 +78,16 @@ def _relax(filters: Dict[str, Any], level: int) -> Dict[str, Any]:
 def _top_k_for(질문유형: str, filters: Dict[str, Any]) -> int:
     """질문유형에 따른 검색 폭 결정.
 
-    추천은 "정답 1개를 찾는" 문제가 아니라 "후보군을 모아 조건으로 거르는" 문제다.
-    top-5 만 보면 위험등급·자산유형 조건에 맞는 상품이 아예 후보에 없을 수 있다.
-    실측: 골드셋 G011 이 top-5 에서 recall 0.00 → top-24 에서 1.00.
+    추천·비교는 "정답 1개를 찾는" 문제가 아니라 "후보군을 모아 조건으로 거르는"
+    문제다. top-5 만 보면 위험등급·자산유형 조건에 맞는 상품이 아예 후보에 없을 수
+    있다. 실측: 골드셋 G011 이 top-5 에서 recall 0.00 → top-24 에서 1.00.
+
+    상품 관여도가 높으면 넓힌다 — 계층 쿼터가 자리를 나누므로, top_k 가 넓어져도
+    규정문서 자리가 줄지 않는다(예전 scope="all" 과 결정적으로 다른 점).
     """
-    if 질문유형 == "추천" or (filters or {}).get("scope") == "all":
+    from index.store import _affinity_of
+
+    if 질문유형 == "추천" or _affinity_of(filters or {}) >= 0.6:
         return config.NUM_DOCS_RECOMMEND
     return config.NUM_DOCS_TO_RETRIEVE
 
@@ -148,15 +162,19 @@ def retrieve_documents(state: RAGState) -> dict:
 
     relax_note = (
         "필터 없음(전체검색)" if used_level < 0
-        else ("완화 없음" if used_level == 0 else f"{used_level}단계 완화")
+        else ("완화 없음" if used_level == 0
+              else f"{used_level}단계 완화({'·'.join(RELAX_STEPS[:used_level])} 해제)")
     )
     dist: Dict[str, int] = {}
     for d in docs:
         key = f"{d['tier']}/{d['chunk_type']}"
         dist[key] = dist.get(key, 0) + 1
 
-    summary = (f"{len(docs)}건 (top_k={top_k}, scope={applied.get('scope', '-')}, "
+    from index.store import _affinity_of
+    summary = (f"{len(docs)}건 (top_k={top_k}, 상품관여도={_affinity_of(applied):.2f}, "
                f"{relax_note}) 분포={dist}")
+    if applied.get("사유"):
+        summary += f" | 사유={applied['사유']}"
     if hyde_doc:
         summary += " | HyDE 병합검색"
 
@@ -164,9 +182,19 @@ def retrieve_documents(state: RAGState) -> dict:
         "documents": docs,
         "applied_filters": applied,
         "filter_retries": state.get("filter_retries", 0) + (1 if used_level != 0 else 0),
+        # chunk_type 분포를 **문자열 요약이 아니라 dict 로** 남긴다 (2026-08-18).
+        #
+        # 예전에는 summary 문자열 안에만 있어서, 분석하려면 정규식으로 다시
+        # 파싱해야 했다. 실패 문항을 볼 때 이 분포가 없으면
+        #   "검색부터 실패인가(원하는 chunk_type 이 아예 안 들어왔다)"
+        #   "검색은 됐는데 인용을 안 한 건가(들어왔는데 안 썼다)"
+        # 를 구분할 수 없다. 두 경우는 고칠 곳이 완전히 다르다.
         "trace": step("retrieve", qid=qid, summary=summary,
                       detail={"scores": [round(h["score"], 3) for h in hits[:5]],
                               "filters": applied,
+                              "chunk_type_dist": dict(dist),
+                              "n_docs": len(docs),
+                              "top_k": top_k,
                               "hyde": truncate(hyde_doc, 120) if hyde_doc else None},
                       ms=t.ms),
     }

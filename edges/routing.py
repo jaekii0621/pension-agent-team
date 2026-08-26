@@ -18,6 +18,21 @@ def safety_gate(state: OverallState) -> str:
     return "blocked"
 
 
+def clarify_gate(state: OverallState) -> str:
+    """되물어야 하는가.
+
+    사유처럼 **답이 갈리는 값**을 확정하지 못했으면 검색으로 내려보내지 않는다.
+    추측해서 진행하면 엉뚱한 사유의 서류를 근거로 그럴듯한 답이 나가는데,
+    사용자는 틀린 줄 모른다. 되묻는 편이 정확하다.
+
+    ⚠️ 되묻기는 **정상 종료**다. 실패 경로가 아니다.
+    """
+    if state.get("needs_clarification"):
+        log_message("정보 부족(사유 미확정) → 역질문으로 종료")
+        return "clarify"
+    return "proceed"
+
+
 def route_after_router(state: OverallState) -> str:
     """라우터가 정한 경로로 보낸다.
 

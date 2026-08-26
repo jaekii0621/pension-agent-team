@@ -10,25 +10,26 @@
              → 부족하면 **아직 못 답한 부분(residual)만** 다시 분해
     2라운드: 위 반복 (최대 config.MAX_ROUNDS)
 
-■ 서브질문마다 검색 범위를 정한다 (2026-08 개편)
-  예전에는 서브질문마다 `source_hint`(제도/세제/일반절차/중도인출절차/상품)를 뽑아
-  그 소스 문서만 보게 했고, 소스가 곧 전문가 프롬프트였다. 두 가지가 문제였다.
+■ 서브질문마다 '상품 관여도'를 매긴다 (2026-08-16 재개편)
 
-    · 소스 5종 분류가 LLM 판단이라 실행마다 흔들리는데, 틀리면 정답 문서군을
-      통째로 못 본다. 보정 규칙(_apply_domain_rules)이 계속 늘어났다.
-    · 연금 도메인에는 선행모델의 회사명·연도처럼 **문서 단위로 확정되는 축이 없다.**
-      억지로 만든 축은 필터가 아니라 잡음이었다.
+  ▸ 1세대: 서브질문마다 `source_hint`(제도/세제/절차/…) 를 뽑아 그 소스만 보게 했다.
+      분류가 흔들리면 정답 문서군을 통째로 못 봤고, 보정 규칙이 계속 늘어났다.
+  ▸ 2세대: 판단을 하나로 줄였다 — "이 서브질문이 상품 추천인가?"
+      추천이면 scope="all", 아니면 scope="doc"(투자설명서 7,339건을 배제).
+      코퍼스의 90%가 투자설명서라 규정문서가 밑에 깔리는 문제는 풀렸지만,
+      **판정 1회의 실패 비용이 코퍼스 절반**이라는 병이 남았다.
+        · "○○펀드 총보수 얼마?" 는 추천이 아닌데 답은 투자설명서에만 있다 → 후보 0건
+        · "세액공제 한도와 담을 채권형 펀드" 는 어느 쪽으로 찍어도 절반이 사라진다
+  ▸ 3세대(지금): 배제하지 않고 **자리를 나눈다.**
 
-  그래서 판단을 하나로 줄였다 — **이 서브질문이 상품 추천인가?**
+      product_intent  "제도" | "혼합" | "상품"   → 0.15 / 0.50 / 0.85
+        검색 결과 top-k 안에서 투자설명서가 가져갈 **자리 비율**이다.
+        양쪽 모두 최소 자리가 보장되므로(config.MIN_STRATUM_QUOTA)
+        판정이 틀려도 정답 코퍼스가 사라지지 않는다.
 
-      추천이다   → scope="all"  : doc 문서 + 투자설명서 전체를 본다
-      아니다     → scope="doc"  : 제도·세제·절차·운용규제 문서만 본다
-
-  이 이분법이 유효한 이유는 코퍼스 구성 때문이다. 투자설명서가 전체의 91%를
-  차지해서, 추천이 아닌 질문에 상품 문서를 열어 두면 제도·절차 문서가 그 밑에
-  깔린다. 반대로 추천 질문에 doc 만 보면 펀드 정보가 아예 없다.
-  실측(persona 시뮬레이션): "IRP 가입 가능한 채권형 펀드는?" 을 필터 없이 검색하면
-  상위 5건이 전부 제도 Q&A 였고 펀드카드는 0건이었다.
+  "규정문서가 상품 문서에 눌려 안 보인다"는 원래 문제도 그대로 해결된다.
+  자리를 나눠 주는 것으로 충분하고, 지울 필요는 없었던 것이다.
+  애매하면 "혼합" 을 고르면 반씩 들어온다 — 2세대에는 이 선택지가 없었다.
 
 ■ 자기완결성이 필터를 대신한다
   선행모델은 분해 규칙에서 self-contained 를 강제했다.
@@ -59,11 +60,12 @@ from utils import Timer, step, truncate
 # ==========================================================================
 class DecomposedItem(BaseModel):
     question: str = Field(description="단독으로 뜻이 통하는 서브질문")
-    is_recommendation: bool = Field(
-        default=False,
-        description="이 서브질문이 '어떤 펀드/상품을 고를까'를 묻는가. "
-                    "펀드명·수익률·총보수·위험등급·클래스를 물으면 true. "
-                    "제도·세제·절차·운용규제를 물으면 false")
+    product_intent: str = Field(
+        default="혼합",
+        description="이 서브질문에 개별 펀드 정보가 얼마나 필요한가. "
+                    "'상품'=펀드명·수익률·총보수·위험등급·클래스를 묻는다 / "
+                    "'제도'=제도·세제·절차·운용규제를 묻는다 / "
+                    "'혼합'=둘 다 필요하거나 애매하다. 애매하면 '혼합'.")
 
 
 class Decomposition(BaseModel):
@@ -76,41 +78,52 @@ class Sufficiency(BaseModel):
 
 
 # ==========================================================================
-def _scope_of(is_recommendation: bool) -> str:
-    """서브질문의 검색 범위. 이것이 우리 파이프라인의 유일한 하드 필터다."""
-    return "all" if is_recommendation else "doc"
+def _affinity_of(intent: str) -> float:
+    """라벨 → 상품 관여도(0.0~1.0).
+
+    **하드 필터가 아니라 자리 배분값이다.** 목록 밖 값이 와도 죽지 않고 기본값으로
+    떨어진다 — 예전 scope 방식이라면 잘못된 라벨 하나가 코퍼스 절반을 지웠다.
+    """
+    return config.PRODUCT_INTENT_LEVELS.get(
+        (intent or "").strip(), config.DEFAULT_PRODUCT_INTENT)
 
 
 def _build_subquestions(items: List[DecomposedItem], original: str,
                         filters: dict, *, round_no: int) -> List[SubQuestion]:
-    """LLM 출력 → SubQuestion 객체. 서브질문별 scope 를 필터에 반영한다."""
+    """LLM 출력 → SubQuestion 객체. 서브질문별 관여도를 필터에 반영한다."""
     out: List[SubQuestion] = []
-    base_funds = list((filters or {}).get("fund_name") or [])
+    base = filters or {}
+    base_funds = list(base.get("fund_name") or [])
+    # 사유는 전역에서 상속한다 — 분해하면 문장에서 빠질 수 있는데,
+    # 빠졌다고 해서 그 조건이 사라진 것은 아니다(펀드명과 같은 이유).
+    base_reason = list(base.get("사유") or [])
+
+    def _mk(q: str, intent: str, qid: str) -> SubQuestion:
+        aff = _affinity_of(intent)
+        f: dict = {"product_affinity": aff, "fund_name": base_funds}
+        if base_reason:
+            f["사유"] = base_reason
+        return SubQuestion(
+            q,
+            qid=qid,
+            round_no=round_no,
+            is_recommendation=aff >= 0.6,     # 답변 프롬프트 선택에만 쓴다
+            filters=f,
+        )
 
     for item in items[: config.MAX_SUB_QUESTIONS]:
         q = (item.question or "").strip()
         if not q:
             continue
-        rec = bool(item.is_recommendation)
-        out.append(SubQuestion(
-            q,
-            qid=f"r{round_no}-{uuid.uuid4().hex[:6]}",
-            round_no=round_no,
-            is_recommendation=rec,
-            # 펀드명은 전역에서 상속한다 — 분해하면 문장에서 빠질 수 있고,
-            # 빠졌다고 해서 그 조건이 사라진 것은 아니다.
-            filters={"scope": _scope_of(rec), "fund_name": base_funds},
-        ))
+        out.append(_mk(q, item.product_intent, f"r{round_no}-{uuid.uuid4().hex[:6]}"))
 
     if not out:                                # 분해 실패 → 원문 1건으로 진행
-        rec = (filters or {}).get("scope") == "all"
-        out.append(SubQuestion(
-            original,
-            qid=f"r{round_no}-orig",
-            round_no=round_no,
-            is_recommendation=rec,
-            filters={"scope": _scope_of(rec), "fund_name": base_funds},
-        ))
+        # 전역 관여도를 그대로 물려받는다.
+        sub = _mk(original, "", f"r{round_no}-orig")
+        sub.filters["product_affinity"] = base.get(
+            "product_affinity", config.DEFAULT_PRODUCT_INTENT)
+        sub.is_recommendation = sub.filters["product_affinity"] >= 0.6
+        out.append(sub)
     return out
 
 
@@ -149,8 +162,10 @@ def decompose_question(state: OverallState) -> dict:
         "trace": step(
             "decompose",
             summary=f"{len(subs)}개로 분리 "
-                    f"(추천 {sum(1 for s in subs if s.is_recommendation)}건)",
-            detail={"questions": [(s.question, s.filters.get("scope")) for s in subs]},
+                    f"(상품위주 {sum(1 for s in subs if s.is_recommendation)}건)",
+            detail={"questions": [
+                (s.question, round(s.filters.get("product_affinity", 0), 2))
+                for s in subs]},
             ms=t.ms,
         ),
     }

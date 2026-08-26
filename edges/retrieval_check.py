@@ -5,7 +5,7 @@
 
       관련 문서 충분?  → 답변 생성
       부족 + 재시도 여유 → 질문 재작성 후 재검색
-      부족 + 재시도 소진 → 웹 검색 폴백
+      부족 + 재시도 소진 → 근거 없이 '확인되지 않습니다' 응답
 
 ■ 이 3분기가 왜 중요한가
   에이전트가 무한루프에 빠지는 가장 흔한 지점이 "검색 실패 → 재검색"이다.
@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import config
+from llm import llm
 from state import RAGState
 from utils import log_message
 
@@ -28,9 +29,21 @@ def assess_documents(state: RAGState) -> str:
     if len(docs) >= config.DOCS_RELEVANCE_THRESHOLD:
         return "enough"
 
+    # ── LLM 예산 게이트 (2026-08-18 신설) ──────────────────────────────
+    #
+    # 재작성→재검색은 한 번 돌 때마다 LLM 을 2~3회 태운다. 예산을 넘긴 상태에서
+    # 더 도는 것은 비용만 늘리고 답변 품질은 별로 올리지 못한다.
+    # (예산 검사가 라운드 경계에만 있어서 문항당 최대 95회까지 나왔던 원인)
+    #
+    # 재시도를 포기해도 "give_up" 으로 답변은 나온다 — 근거 없이도
+    # "제공된 자료로는 확인되지 않습니다" 를 낼 수 있게 되어 있다.
+    if llm.over_budget():
+        log_message(f"LLM 예산 초과({llm.budget_note()}) → 재검색 포기")
+        return "give_up"
+
     if retries > config.MAX_GRADING_RETRIES:
-        log_message(f"문서 확보 실패({retries}회) → 웹 검색으로 전환")
-        return "web" if config.WORKFLOW_SETTINGS["web_search_fallback"] else "give_up"
+        log_message(f"문서 확보 실패({retries}회) → 근거 없이 응답")
+        return "give_up"
 
     log_message(f"관련 문서 {len(docs)}건 → 질문 재작성 후 재검색 ({retries}회차)")
     return "rewrite"

@@ -16,7 +16,7 @@
   합성        → combiner.py
 """
 
-from .answer_generator import generate_answer, generate_web_answer          # noqa: F401
+from .answer_generator import generate_answer                              # noqa: F401
 from .calculator import calc_agent                                          # noqa: F401
 from .combiner import combine_answer, out_of_scope_answer                   # noqa: F401
 from .document_grader import grade_documents                                # noqa: F401
@@ -30,16 +30,17 @@ from .question_decomposer import (                                          # no
 from .question_rewriter import rewrite_question                             # noqa: F401
 from .router import route_query                                             # noqa: F401
 from .safety_checker import check_safety                                    # noqa: F401
+from .slot_filler import clarify_answer, resolve_slots                      # noqa: F401
 from .strategy import strategy_agent                                        # noqa: F401
 from .verifier import verify_answer                                         # noqa: F401
-from .web_searcher import search_web                                        # noqa: F401
 
 __all__ = [
-    "check_safety", "analyze_query", "route_query",
+    "check_safety", "analyze_query", "resolve_slots", "clarify_answer",
+    "route_query",
     "decompose_question", "decompose_residual", "check_sufficiency",
     "retrieve_documents", "grade_documents",
-    "generate_answer", "generate_web_answer",
-    "verify_answer", "rewrite_question", "search_web",
+    "generate_answer",
+    "verify_answer", "rewrite_question",
     "calc_agent", "strategy_agent",
     "combine_answer", "out_of_scope_answer",
 ]

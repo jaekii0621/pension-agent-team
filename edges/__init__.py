@@ -7,11 +7,11 @@
 
 from .decomposition import send_sub_questions, should_repeat        # noqa: F401
 from .retrieval_check import assess_documents                       # noqa: F401
-from .routing import route_after_router, safety_gate                # noqa: F401
+from .routing import clarify_gate, route_after_router, safety_gate  # noqa: F401
 from .verification_check import assess_verdict                      # noqa: F401
 
 __all__ = [
-    "safety_gate", "route_after_router",
+    "safety_gate", "clarify_gate", "route_after_router",
     "send_sub_questions", "should_repeat",
     "assess_documents", "assess_verdict",
 ]

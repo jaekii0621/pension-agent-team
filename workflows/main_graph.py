@@ -15,7 +15,9 @@
     START
      → check_safety            안전·범위 검사
      → [safety_gate]           blocked → 안내문 → END
-     → analyze_query           소스·주제·질문유형 추출 (검색 필터)
+     → analyze_query           질문유형·펀드명·상품관여도 추출
+     → resolve_slots           답이 갈리는 값(사유) 확정 시도
+     → [clarify_gate]          확정 실패 → 역질문 → END (정상 종료)
      → route_query             경로 + 도메인 전문가 배정
      → [route_after_router]    out_of_scope → 안내문 / calc → 계산기 / rag → 분해
      → (calc_agent)            계산이 필요하면 먼저 실행
@@ -64,19 +66,43 @@ def rag_worker(payload: Dict[str, Any]) -> dict:
         "qid": qid,
         "question": sub_q,
         "is_recommendation": payload.get("is_recommendation", False),
-        "scope": (payload.get("filters") or {}).get("scope"),
+        "product_affinity": (payload.get("filters") or {}).get("product_affinity"),
+        "사유": (payload.get("filters") or {}).get("사유") or [],
         "answer": res.get("answer", ""),
         "citations": res.get("citations", []),
+        "evidence_sufficient": res.get("evidence_sufficient"),
+        # 답변이 말했는데 근거에 없는 값 — 환각 후보 (2026-08-23)
+        "unsupported_values": res.get("unsupported_values") or [],
         "evidence_ok": res.get("evidence_ok", False),
         "verified": verdict.get("pass", True),
         "score": verdict.get("score"),
-        "web_used": res.get("web_used", False),
     }
 
+    # ⚠️ citations 를 여기서 올려보내지 않는다 (2026-08-18 수정)
+    #
+    #   예전 코드:  "citations": res.get("citations", []),
+    #
+    #   OverallState.citations 는 **리듀서**(state.dedup_citations)가 붙은 필드다.
+    #   리듀서는 덮어쓰지 않고 **합친다.** 그래서 이 줄이 있으면
+    #
+    #       ① rag_worker 가 서브답변의 *지역 번호* 인용을 올려보내고
+    #       ② 나중에 combine_answer 가 *전역 번호* 인용(global_cites)을 올려보내는데
+    #       ③ dedup 은 chunk_id 기준으로 **먼저 온 것을 남기므로**
+    #          최종 state["citations"] 에 지역 번호가 살아남는다
+    #
+    #   실측(78문항)에서 번호가 중복된 문항이 8건 나왔다.
+    #       P-A3  citations n = [1, 2, 3, 1, 2, 3]   ← 서브질문 2개의 지역번호
+    #       D-E4  citations n = [1, 2, 3, 4, 1, 2]
+    #       D-F3  citations n = [1, 1]
+    #
+    #   사용자가 보는 답변 하단 출처 목록은 combiner 가 global_cites 로 따로 만들어서
+    #   멀쩡했지만, **채점자가 읽는 산출물의 citations 필드가 오염됐다.**
+    #   자동 채점을 이 필드로 하면 인용 정확도가 통째로 틀어진다.
+    #
+    #   서브답변의 인용은 qa_pairs[*]["citations"] 안에 이미 들어 있고
+    #   combiner 의 _renumber 가 그것을 읽는다. 여기서 또 올려보낼 이유가 없다.
     return {
         "qa_pairs": [qa],
-        "citations": res.get("citations", []),
-        "web_used": res.get("web_used", False),
         "llm_calls": res.get("llm_calls", 0),
         "trace": res.get("trace", []),
     }
@@ -91,11 +117,10 @@ def aggregate(state_: state.OverallState) -> dict:
     """
     pairs = state_.get("qa_pairs", []) or []
     ok = sum(1 for p in pairs if p.get("evidence_ok"))
-    web = sum(1 for p in pairs if p.get("web_used"))
     return {
         "trace": step("aggregate",
                       summary=f"라운드{state_.get('round_no', 0)} 취합 — "
-                              f"QA {len(pairs)}건 (근거확보 {ok}, 웹폴백 {web})"),
+                              f"QA {len(pairs)}건 (근거확보 {ok})"),
     }
 
 
@@ -114,6 +139,7 @@ graph.add_node("aggregate", aggregate)
 graph.add_node("check_sufficiency", nodes.check_sufficiency)
 graph.add_node("combine_answer", nodes.combine_answer)
 graph.add_node("out_of_scope", nodes.out_of_scope_answer)
+graph.add_node("clarify", nodes.clarify_answer)
 
 if config.WORKFLOW_SETTINGS["use_calculator"]:
     graph.add_node("calc_agent", nodes.calc_agent)
@@ -133,9 +159,24 @@ else:
     graph.add_edge(START, "analyze_query")
 
 graph.add_edge("out_of_scope", END)
+graph.add_edge("clarify", END)
 
-# ── 2. 질의 분석 → 라우팅 ─────────────────────────────────────────────
-graph.add_edge("analyze_query", "route_query")
+# ── 2. 질의 분석 → 슬롯 해소 → 라우팅 ─────────────────────────────────
+#
+# resolve_slots 는 "사유처럼 답이 갈리는 값" 을 확정한다. 확정하지 못했는데 그 값이
+# 꼭 필요하면 검색으로 내려보내지 않고 **되묻고 끝낸다**(정상 종료).
+# 추측해서 진행하면 엉뚱한 사유의 서류를 근거로 그럴듯한 오답이 나가는데, 그건
+# 사용자가 틀린 줄 모르는 종류의 실패라 가장 비싸다.
+if config.WORKFLOW_SETTINGS.get("resolve_slots", True):
+    graph.add_node("resolve_slots", nodes.resolve_slots)
+    graph.add_edge("analyze_query", "resolve_slots")
+    graph.add_conditional_edges(
+        "resolve_slots",
+        edges.clarify_gate,
+        {"proceed": "route_query", "clarify": "clarify"},
+    )
+else:
+    graph.add_edge("analyze_query", "route_query")
 
 _calc_target = "calc_agent" if config.WORKFLOW_SETTINGS["use_calculator"] else "decompose"
 graph.add_conditional_edges(
@@ -203,6 +244,8 @@ def run(question: str, *, user_profile: Dict[str, Any] | None = None,
         "citations": [],
         "trace": [],
         "llm_calls": 0,
+        "needs_clarification": False,
+        "slots": {},
     }
     result = pension_agent.invoke(initial, config={"recursion_limit": 60})
     result["usage"] = llm.usage_for(key)

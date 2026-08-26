@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import config
+from llm import llm
 from state import RAGState
 from utils import log_message
 
@@ -28,6 +29,15 @@ def assess_verdict(state: RAGState) -> str:
 
     if verdict.get("pass", True):
         return "ok"
+
+    # ── LLM 예산 게이트 (2026-08-18 신설) ──────────────────────────────
+    #
+    # 재생성·재작성은 답변 품질을 조금 올리려고 LLM 을 더 태우는 선택적 단계다.
+    # 예산을 넘겼으면 현재 답변으로 끝낸다 — 검증 실패 사실은 verdict 에 남으므로
+    # 성능 측정에서 이 비율을 볼 수 있다.
+    if llm.over_budget():
+        log_message(f"LLM 예산 초과({llm.budget_note()}) → 현재 답변으로 종료")
+        return "give_up"
 
     if retries > config.MAX_VERIFY_RETRIES:
         log_message(f"검증 재시도 소진({retries}회) → 현재 답변으로 종료")

@@ -23,6 +23,22 @@ from typing import Any, Dict, List, Optional
 import config
 
 # --------------------------------------------------------------------------
+def _force_utf8_stdio() -> None:
+    """Windows 콘솔(cp949)에서 한글·기호가 UnicodeEncodeError 로 죽는 것을 막는다.
+
+    기본 인코딩이 cp949 라 "⚠", "→", "▸" 같은 기호를 print 하는 순간 프로세스가
+    죽는다. 로그·트레이스 전부가 한국어라 사실상 모든 실행에서 터진다.
+    (errors="replace" 까지 두는 이유: 재설정이 안 되는 환경에서도 죽지는 않게)
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+_force_utf8_stdio()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -111,24 +127,64 @@ def render_mermaid(trace: List[dict]) -> str:
 # ==========================================================================
 # 텍스트 유틸
 # ==========================================================================
-_TOKEN_RE = re.compile(r"[가-힣]+|[a-zA-Z]+|\d+(?:[.,]\d+)?%?")
+# 토큰 패턴 — **순서가 중요하다.** 앞에 있는 대안이 먼저 먹는다.
+#
+#  ① 영문/숫자 코드 : 하이픈으로 이어진 덩어리를 통째로 잡는다  (C-P2e, C-P-I, A-e)
+#  ② 한글 어절
+#  ③ 남은 영문
+#  ④ 숫자(소수·퍼센트 포함)
+_TOKEN_RE = re.compile(
+    r"[A-Za-z]+\d*(?:-[A-Za-z0-9]+)+"     # ① C-P2e, C-P-I, A-e, C-P2
+    r"|[가-힣]+"                           # ② 한글
+    r"|[A-Za-z]+\d*"                       # ③ TDF, ETF, C1, KOSPI200
+    r"|\d+(?:[.,]\d+)?%?"                  # ④ 16.5%, 900
+)
+
+# 코드 표기 변형을 하나로 묶기 위한 정규형: 하이픈·공백 제거 + 소문자
+_CODE_STRIP_RE = re.compile(r"[-\s]+")
 
 
 def tokenize_ko(text: str) -> List[str]:
     """한국어 친화 토크나이저 (형태소 분석기 의존성 없이).
 
-    전략: 어절/영문/숫자 토큰 + **한글 2-gram**.
+    ■ 전략 1 — 한글 2-gram
       "중도인출" 과 "중도 인출" 이 같은 2-gram(중도, 도인, 인출)을 공유하므로,
-      띄어쓰기가 달라도 BM25 가 매칭된다. 형태소 분석기를 안 써도
-      이 정도 코퍼스(494청크)에서는 충분히 잘 동작한다.
+      띄어쓰기가 달라도 BM25 가 매칭된다.
+
+    ■ 전략 2 — 클래스 코드를 부수지 않는다 (2026-08 수정)
+      예전 패턴은 `[a-zA-Z]+` 라서 하이픈에서 끊겼다. 실측하면 이랬다.
+
+          'C-P2e' → ['c', 'p', '2', 'e']
+          'C-e'   → ['c', 'e']          ← 'Ce' → ['ce'] 와 아예 다른 토큰
+
+      즉 "C-P2e 로 살 수 있어?" 라고 물으면 BM25 가 알파벳 c/p/e 가 든 아무 청크나
+      끌어왔다. "BM25 는 코드에 강하다"는 전제가 정반대로 깨져 있었던 것이다.
+
+      운용사마다 표기가 24종으로 갈리는데(C-P/C-p, Ce/C-e/C-E) **데이터는 각 문서의
+      정본이라 정규화하지 않는다**는 것이 코퍼스 쪽 방침이다. 그래서 질의·문서
+      양쪽에 같은 토크나이저를 태워 여기서 묶는다.
+
+          'C-P2e' → ['c-p2e', 'cp2e']    ← 원형 + 하이픈 제거 정규형
+          'Ce'    → ['ce']
+          'C-e'   → ['c-e', 'ce']        ← 정규형에서 'Ce' 와 만난다
     """
     if not text:
         return []
     out: List[str] = []
     for tok in _TOKEN_RE.findall(text):
-        out.append(tok.lower())
+        low = tok.lower()
+        out.append(low)
+
+        # 한글 어절 → 2-gram 확장
         if len(tok) > 1 and "가" <= tok[0] <= "힣":
             out.extend(tok[i:i + 2] for i in range(len(tok) - 1))
+            continue
+
+        # 코드 토큰 → 하이픈 제거 정규형을 함께 넣는다 (C-e ↔ Ce 를 잇는다)
+        if "-" in low:
+            norm = _CODE_STRIP_RE.sub("", low)
+            if norm and norm != low:
+                out.append(norm)
     return out
 
 

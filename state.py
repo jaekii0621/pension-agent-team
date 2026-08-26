@@ -67,17 +67,6 @@ def add_int(old: int, new: int) -> int:
     return (old or 0) + (new or 0)
 
 
-def or_bool(old: bool, new: bool) -> bool:
-    """병렬 브랜치 중 하나라도 True 면 True.
-
-    ※ 이 리듀서가 없으면 서브질문 2개가 동시에 web_used 에 쓰는 순간
-      LangGraph 가 InvalidUpdateError("Can receive only one value per step")로 죽는다.
-      **병렬로 갈라지는 그래프에서 여러 노드가 건드리는 키는 예외 없이 리듀서가 필요하다.**
-      (실제로 이 프로젝트에서 그 에러를 한 번 맞고 추가한 함수다.)
-    """
-    return bool(old) or bool(new)
-
-
 # ==========================================================================
 # 서브질문 트리 노드
 #   선행모델의 QuestionNode 대응. LangGraph 가 커스텀 클래스를 직렬화하지 못해서
@@ -133,22 +122,30 @@ class SubQuestion:
 # 검색 필터 — 선행모델의 {company_name, year} 자리에 들어가는 우리 스키마
 # ==========================================================================
 class QueryFilters(TypedDict, total=False):
-    """질문에서 뽑아내는 검색 조건. **축이 둘뿐이다.**
+    """질문에서 뽑아내는 검색 조건. **코퍼스를 지우는 축이 하나도 없다.**
 
-    선행모델이 하드 필터로 쓴 것도 둘이었다(company_name, year). 그쪽이 LLM 으로
-    뽑기까지 한 topics 를 화이트리스트에서 제외한 이유와 같다 — 필터는 질문 쪽 값과
-    청크 쪽 값의 완전일치 매칭이라, **양쪽 모두 누락이 없어야** 성립한다.
+    필터는 질문 쪽 값과 청크 쪽 값의 완전일치 매칭이라, 양쪽 모두 누락이 없어야
+    성립한다. 그 조건을 만족하지 못하는 축은 전부 배제형에서 뺐다.
 
-    scope      : "doc"  = 규정문서(제도·세제·절차·운용규제)만
-                 "all"  = 규정문서 + 투자설명서
-                 서브질문마다 LLM 이 '추천인가' 하나만 판단해 정한다.
-    fund_name  : 질문에 특정 펀드가 명시됐을 때만. 투자설명서 1권 = 펀드 1개라
-                 그 문서의 전 청크에 대해 참인 확정값이다(= company_name 과 동격).
+    product_affinity : 0.0~1.0. **필터가 아니라 자리 배분값이다.**
+                 top-k 안에서 투자설명서가 가져갈 비율을 정한다. 규정문서와
+                 투자설명서 모두 최소 자리를 보장받으므로(MIN_STRATUM_QUOTA),
+                 이 값이 틀려도 정답 코퍼스가 사라지지 않는다.
+                 (예전 `scope: "doc"|"all"` 을 대체한다. scope 가 들어와도
+                  index.store._affinity_of 가 근사값으로 변환해 준다.)
+    사유         : 장르C(중도인출) 전용 **소프트 필터**. 5개 문서의 도입부가 동일해
+                 검색으로는 구분되지 않아 필요하다. 결과가 모자라면 완화 사다리
+                 1단계에서 자동으로 풀린다. `사유` 값을 가진 청크만 대조하므로
+                 다른 코퍼스를 지우지 않는다.
+    fund_name  : 유일한 배제형 조건. 투자설명서 1권 = 펀드 1개라 그 문서의 전 청크에
+                 대해 참인 확정값이고(= 선행모델 company_name 과 동격), 펀드명이
+                 없는 규정문서 청크는 배제하지 않는다.
 
     나머지(주제·계좌유형·목적·자산유형·위험등급)는 전부 **점수 가중과 프롬프트**로
     내렸다. 가중은 후보를 지우지 않으므로 잘못 걸려도 순위만 밀린다.
     """
-    scope: str                   # "doc" | "all"
+    product_affinity: float      # 0.0(제도) ~ 1.0(상품)
+    사유: List[str]              # ["주택구입"] — config.REASON_VALUES 중
     fund_name: List[str]         # ["미래에셋퇴직플랜증권자투자신탁1호(채권)"]
 
 
@@ -163,12 +160,22 @@ class OverallState(TypedDict, total=False):
 
     # --- 안전성 ---
     safe: bool
-    safety_reason: str
+    safety_reason: str           # 사람이 읽는 판정 이유 한 문장
+    safety_category: str         # 기계가 읽는 라벨: 개인정보|위법조력|유해|범위밖|""
+    safety_caution: str          # 차단은 아니지만 답변 단계가 알아야 하는 신호
 
     # --- 질의 분석 (선행모델의 extract_metadata 에 대응) ---
     질문유형: Literal["사실조회", "계산", "추천", "절차", "혼합"]
     filters: Annotated[Dict[str, Any], merge_dict]
     is_recommendation: bool
+
+    # --- 슬롯 해소 / 역질문 ---
+    #   답이 갈리는 값(사유)을 확정했는지, 못 했으면 무엇을 되물을지.
+    #   되묻기는 **실패가 아니라 정상 종료**다 — 정보가 부족한 상태의 단정 답변보다
+    #   한 번 되묻는 편이 정확하기 때문이다.
+    slots: Annotated[Dict[str, Any], merge_dict]
+    needs_clarification: bool
+    clarification: str
 
     # --- 라우팅 ---
     route: str                   # "rag" | "calc" | "recommend" | "out_of_scope"
@@ -195,7 +202,6 @@ class OverallState(TypedDict, total=False):
     # --- 계측 (성능 측정 단계라 이게 중요하다) ---
     trace: Annotated[List[dict], operator.add]
     llm_calls: Annotated[int, add_int]
-    web_used: Annotated[bool, or_bool]     # ← 병렬 rag_worker 들이 함께 쓴다
 
 
 # ==========================================================================
@@ -217,6 +223,7 @@ class RAGState(TypedDict, total=False):
     grading_retries: int
     irrelevance_reason: str
     hyde_doc: str                # HyDE 가 만든 가상 답변 (검색 전용, 답변 근거 아님)
+    safety_caution: str          # 안전검사가 넘긴 주의 신호 (위법조력|유해|프롬프트공격)
 
     # 생성
     answer: str
@@ -226,9 +233,6 @@ class RAGState(TypedDict, total=False):
     # 검증
     verdict: Dict[str, Any]
     verify_retries: int
-
-    # 폴백
-    web_used: bool
 
     # 계측
     trace: Annotated[List[dict], operator.add]

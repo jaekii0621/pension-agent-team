@@ -43,6 +43,8 @@ def send_sub_questions(state: OverallState) -> Union[List[Send], str]:
             "질문유형": state.get("질문유형", "사실조회"),
             "filters": s.get("filters") or state.get("filters", {}),
             "is_recommendation": bool(s.get("is_recommendation", False)),
+            # 안전검사가 넘긴 주의 신호. 차단은 안 했지만 답변 단계가 알아야 한다.
+            "safety_caution": state.get("safety_caution", ""),
             "hyde_doc": "",          # 재작성 단계에서 채워진다
             "filter_retries": 0,
             "grading_retries": 0,
@@ -59,6 +61,13 @@ def should_repeat(state: OverallState) -> str:
     if state.get("round_no", 0) >= config.MAX_ROUNDS - 1:
         log_message(f"라운드 한도({config.MAX_ROUNDS}) 도달 → 종료")
         return "finish"
+    # 라운드 경계 검사 — **이것만으로는 부족했다** (2026-08-18 주석 보강)
+    #
+    # 여기는 "라운드를 한 번 더 돌까?" 를 정하는 지점이라, 이미 한 라운드를
+    # 다 태운 뒤에야 예산을 본다. 서브질문 fan-out 안쪽 루프는 못 막는다.
+    # 그래서 실제 호출 게이트는 llm.over_budget() 으로 옮겼고
+    # (edges/retrieval_check.py · edges/verification_check.py),
+    # 여기는 라운드 단위의 2차 방어선으로 남긴다.
     if (state.get("llm_calls", 0) or 0) >= config.LLM_CALL_BUDGET:
         log_message(f"LLM 호출 예산({config.LLM_CALL_BUDGET}) 소진 → 종료")
         return "finish"
