@@ -109,8 +109,14 @@ _TOK_HIGH = [
     re.compile(r"\d{1,3}(?:,\d{3})+\s*원"),            # 264,000원
     re.compile(r"\d[\d,]*\s*만\s*원"),                 # 1,500만 원 · 900만원
     re.compile(r"\d[\d,]*\s*억\s*원"),                 # 1억원
-    re.compile(r"(?<![A-Za-z])C-[A-Za-z]{1,3}\d?"),    # C-P · C-Pe
-    re.compile(r"(?<![A-Za-z])CRP\d?"),                # CRP
+    # ⚠️ 앞뒤 경계를 **둘 다** 요구한다 (2026-08-26).
+    #    예전 패턴 `C-[A-Za-z]{1,3}\d?` 는 뒷경계가 없어서 "C-P2e" 를 "C-P2" 로
+    #    잘랐고, 실제 클래스가 C-P2 인 **다른 펀드**(신영마라톤)와 문자열이 우연히
+    #    겹쳐 그 펀드가 P-A4 답변의 출처로 붙었다.
+    #    코퍼스 실측 클래스코드: C-P · C-Pe · C-e · C-P2 · C-P2e · C-P1e · C-Pe2 ·
+    #    C-P2I … 글자와 숫자가 섞이므로 통째로 잡아야 잘림이 안 생긴다.
+    re.compile(r"(?<![A-Za-z0-9])C-[A-Za-z0-9]{1,4}(?![A-Za-z0-9])"),  # C-P · C-P2e
+    re.compile(r"(?<![A-Za-z0-9])CRP\d?(?![A-Za-z0-9])"),             # CRP
     re.compile(r"(?:위험)?등급\s*[1-6]|[1-6]\s*등급"),    # 등급 5 · 5등급
 ]
 _TOK_LOW = [
@@ -120,6 +126,23 @@ _TOK_LOW = [
 ]
 
 _AUTO_MAX = 3          # 자동 부착 상한 — 목록이 길어지면 오히려 근거가 흐려진다
+
+
+def _fund_of(ch: dict) -> str:
+    """청크의 펀드명. 청크는 `fund={"name": ...}` 구조다 (2026-08-27).
+
+    ⚠️ `ch.get("fund_name")` 은 **항상 None 이었다.** `fund_name` 은
+    `to_citation()` 이 만드는 **인용 레코드**의 키이지 청크의 키가 아니다.
+    그래서 아래 두 곳이 조용히 죽어 있었다.
+      · attach_citations_by_value 의 `named` — "답변이 특정한 펀드가 아니면
+        버린다"는 정밀도 가드가 한 번도 발동하지 않았다.
+      · _restored_cite_ok — 모든 청크를 '규정문서'로 보고 무조건 통과시켰다.
+    P-A4 에서 신영마라톤이 계속 붙은 이유가 이것이다(6차 실행에서 확인).
+    """
+    f = ch.get("fund")
+    if isinstance(f, dict):
+        return f.get("name") or ""
+    return ch.get("fund_name") or ""
 
 
 def _fund_core(name: str) -> str:
@@ -163,19 +186,25 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
     # 근거로 붙을 수 있다. 답변에 펀드명이 나와 있으면 그 펀드 청크를 우선한다.
     # (상품 트랙에 인용 0건이 몰려 있어서 — 31건 중 23건 — 여기가 정밀도의 관건이다)
     ans_n = _norm(answer or "")
-    named = {ch.get("fund_name") for ch in ordered
-             if ch.get("fund_name") and _fund_core(ch["fund_name"]) in ans_n}
+    named = {_fund_of(ch) for ch in ordered
+             if _fund_of(ch) and _fund_core(_fund_of(ch)) in ans_n}
 
     hits = []            # (펀드명 일치, HIGH 수, LOW 수, 청크, 일치값)
     covered = set()
     for ch in ordered:
-        body = _norm(ch.get("text") or "")
-        mh = {v for v in hi if v in body}
-        ml = {v for v in lo if v in body}
+        # ⚠️ 부분문자열이 아니라 **양쪽에서 뽑은 토큰끼리** 맞춘다 (2026-08-26).
+        #    부분문자열 대조는 답변의 "0.28%" 가 청크의 "10.28%" 안에서 걸리고,
+        #    "C-P2" 가 "C-P2e" 안에서 걸린다 — 둘 다 다른 펀드를 출처로 붙이는
+        #    경로다. 같은 정규식으로 청크에서도 값을 뽑아 집합으로 맞추면
+        #    경계가 자동으로 지켜진다.
+        bhi, blo = _tokens(ch.get("text") or "")
+        body_vals = bhi | blo
+        mh = hi & body_vals
+        ml = lo & body_vals
         covered |= mh | ml
         if ch.get("chunk_id") in already:
             continue
-        fund_ok = bool(named) and ch.get("fund_name") in named
+        fund_ok = bool(named) and _fund_of(ch) in named
         # HIGH 한 개면 충분, LOW 만이면 두 개 이상이어야 붙인다
         if mh or len(ml) >= 2:
             hits.append((1 if fund_ok else 0, len(mh), len(ml), ch,
@@ -197,6 +226,34 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
     # 어느 청크에도 없는 값 = 근거 없이 말한 수치
     unsupported = sorted((hi | lo) - covered)
     return cites, unsupported
+
+
+def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set) -> bool:
+    """본문 `[n]` 으로 복원하려는 청크가 답변과 실제로 맞물리는지 대조한다.
+
+    ■ 왜 필요한가 (2026-08-26)
+      구조화 출력 파싱이 실패하면(clova_client 의 salvage) `citations` 가 **무조건
+      빈 배열**이 된다. 그러면 아래 복원 경로가 도는데, 이 경로는 모델이 본문에 쓴
+      번호를 **검증 없이 검색 랭킹 순서에 그대로 매핑**했다. 모델이 매긴 번호와
+      우리 랭킹이 어긋나면 답변과 무관한 청크가 출처로 붙는다.
+      실측 P-A4: 답변 표에 없는 펀드(신영마라톤)가 출처에 붙었다.
+
+    ■ 무엇을 대조하나 — 펀드카드에만 건다
+      펀드카드는 "이 답변이 이 펀드를 말하고 있는가" 를 펀드명·수치로 확인할 수 있다.
+      규정문서(정책 청크)는 답변이 수치 없이 서술로만 답하는 경우가 많아 같은 대조를
+      걸면 정상 인용까지 날아간다. 그래서 펀드카드만 검증한다 —
+      오매칭이 실제로 관측된 것도 펀드카드 쪽이다.
+    """
+    fund = _fund_of(ch)
+    if not fund:
+        return True                     # 규정문서는 그대로 통과
+    if _fund_core(fund) in _norm(answer or ""):
+        return True                     # 답변이 이 펀드를 직접 언급했다
+    bhi, blo = _tokens(ch.get("text") or "")
+    body_vals = bhi | blo
+    if hi & body_vals:
+        return True                     # 답변의 특이값이 이 카드에 실제로 있다
+    return len(lo & body_vals) >= 2
 
 
 def generate_answer(state: RAGState) -> dict:
@@ -269,16 +326,28 @@ def generate_answer(state: RAGState) -> dict:
     #   "인용 0건" 으로 처리됐다. 특히 구조화 파싱이 실패해 원문을 그대로 담은
     #   경우(구제 경로)에는 배열이 반드시 비므로, 이 복원이 없으면
     #   근거표시 점수를 통째로 잃는다.
+    #   ⚠️ 다만 **번호를 그대로 믿지는 않는다** (2026-08-26 보강)
+    #        모델이 매긴 번호와 우리 검색 랭킹이 어긋나면 답변과 무관한 청크가
+    #        붙는다(P-A4: 답변 표에 없는 펀드가 출처로). 그래서 복원 대상이
+    #        펀드카드인 경우 답변이 그 펀드를 실제로 말했는지 대조한다.
     if not cites and res.main_answer:
+        hi, lo = _tokens(res.main_answer)
+        dropped = 0
         for n in sorted({int(x) for x in CITE_IN_TEXT.findall(res.main_answer)}):
             i = n - 1
-            if 0 <= i < len(ordered):
-                c = to_citation(ordered[i])
-                c["n"] = n
-                c["quote"] = ""            # 모델이 인용문을 안 줬다
-                cites.append(c)
-        if cites:
-            log.info("본문 인용 번호에서 근거 %d건 복원", len(cites))
+            if not (0 <= i < len(ordered)):
+                continue
+            if not _restored_cite_ok(ordered[i], res.main_answer, hi, lo):
+                dropped += 1
+                continue
+            c = to_citation(ordered[i])
+            c["n"] = n
+            c["quote"] = ""            # 모델이 인용문을 안 줬다
+            c["restored"] = True       # 본문 번호에서 복원한 것임을 표시
+            cites.append(c)
+        if cites or dropped:
+            log.info("본문 인용 번호에서 근거 %d건 복원 (대조 불일치로 %d건 버림)",
+                     len(cites), dropped)
 
     # ── 상위 3건 폴백을 제거했다 (2026-08-18) ─────────────────────────
     #
@@ -321,6 +390,8 @@ def generate_answer(state: RAGState) -> dict:
                       summary=f"[{mode}] {len(res.main_answer)}자, 인용 {len(cites)}건"
                               + (f"(자동 {sum(1 for c in cites if c.get('auto'))})"
                                  if any(c.get("auto") for c in cites) else "")
+                              + (f"(본문복원 {sum(1 for c in cites if c.get('restored'))})"
+                                 if any(c.get("restored") for c in cites) else "")
                               + f", 근거충분={res.evidence_sufficient}"
                               + (f", 미근거값 {len(unsupported)}개" if unsupported else "")
                               + (f", 주의={caution}" if caution else ""),

@@ -43,3 +43,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 server.log
+
+# 로컬 실험용 스크래치 — 공유하지 않는다
+scratchpad/

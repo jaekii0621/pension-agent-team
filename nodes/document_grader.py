@@ -72,7 +72,10 @@ def grade_documents(state: RAGState) -> dict:
     head, tail = docs[:GRADE_LIMIT], docs[GRADE_LIMIT:]
 
     with Timer() as t:
-        with ThreadPoolExecutor(max_workers=min(8, len(head))) as ex:
+        # 동시 요청 수는 설정으로 뺀다 (2026-08-27). 8 고정일 때 6차 실행에서
+        # P-B1 이 CLOVA 레이트리밋(429) 재시도 4회를 모두 소진하고 죽었다.
+        workers = max(1, min(config.GRADE_WORKERS, len(head)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             results = list(ex.map(lambda d: _grade_one(question, d), head))
 
     kept = [r["chunk"] for r in results if r["ok"]] + tail

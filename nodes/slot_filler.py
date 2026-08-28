@@ -125,6 +125,22 @@ def _clean(values: List[str]) -> List[str]:
     return out
 
 
+def _accounts_in_question(question: str) -> List[str]:
+    """질문에 표기된 계좌유형을 **전부** 모은다. LLM 없이 목록 대조.
+
+    한 질문이 둘 이상을 언급할 수 있어서(예: "DC 에서 IRP 로 옮기면"),
+    첫 매칭만 보면 LLM 이 옳게 뽑은 값을 근거 없다고 잘못 버리게 된다.
+    """
+    q = (question or "").upper().replace(" ", "")
+    found: List[str] = []
+    for canon, aliases in config.ACCOUNT_ALIASES.items():
+        for a in aliases:
+            if a.upper().replace(" ", "") in q:
+                found.append(canon)
+                break
+    return found
+
+
 def _account_in_question(question: str) -> str:
     """질문에 계좌유형이 이미 적혀 있으면 그것. LLM 없이 목록 대조.
 
@@ -132,12 +148,8 @@ def _account_in_question(question: str) -> str:
     감점이다. LLM 추출이 놓쳐도 여기서 받친다 — 표기 변형 목록 대조라 오탐이 없다.
     (query_analyzer 의 펀드명 목록 대조와 같은 방어다)
     """
-    q = (question or "").upper().replace(" ", "")
-    for canon, aliases in config.ACCOUNT_ALIASES.items():
-        for a in aliases:
-            if a.upper().replace(" ", "") in q:
-                return canon
-    return ""
+    found = _accounts_in_question(question)
+    return found[0] if len(found) == 1 else ""
 
 
 def resolve_slots(state: OverallState) -> dict:
@@ -166,12 +178,84 @@ def resolve_slots(state: OverallState) -> dict:
     사유 = _clean(res.사유)
     needs = bool(res.사유_필요)
 
-    # 계좌유형 — LLM 추출을 목록 대조가 받친다 (사용자가 이미 밝혔으면 안 묻는다)
+    # ── 계좌유형 — 목록 대조를 **폴백이 아니라 검증**으로 쓴다 (2026-08-26) ──
+    #
+    # 예전 코드는 `계좌유형 = LLM값 or _account_in_question(question)` 이었다.
+    # 목록 대조가 폴백 자리에만 있어서, LLM 이 값을 내면 **질문에 근거가 있는지
+    # 확인하지 않고** 그대로 통과했다.
+    #
+    #   실측(5차 78문항): 계좌유형이 채워진 24건 중 6건이 질문에 근거가 없다.
+    #       P-A1 "좋은 연금 상품 하나 추천해 주세요"        → DB
+    #       P-E1 "키움연금증권자투자신탁… 클래스별 보수"     → 연금저축
+    #       P-G4 "55세 전에 깨면 어떻게 되나요?"             → IRP
+    #       D-C2 "주택 신축하는데 중도인출 서류 뭐 필요해요?" → IRP
+    #       D-D3 "연금계좌 평가액 5천만원이고…"              → 연금저축
+    #       D-E1 "명퇴수당 연금계좌에 넣으면 절세법이…"       → IRP
+    #     '연금계좌' 는 IRP·연금저축을 **둘 다 포함하는 상위어**인데 셋이 한쪽으로
+    #     좁혀졌다. SlotResolution.계좌유형 설명에 "추측하지 마라" 라고 써 뒀는데도
+    #     추측한 값이 그대로 통과한 것이다.
+    #
+    # ■ 파급이 큰 이유 — 되묻기가 조용히 꺼진다
+    #     acct_needs = 계좌유형_필요 and not 계좌유형
+    #   환각으로 값이 채워지면 acct_needs 가 False 가 되어 역질문 경로까지 막힌다.
+    #   D-C2 가 그 경우다 — 주택 신축 중도인출 서류는 DC 냐 IRP 냐로 답이 갈리는데
+    #   묻지 않고 IRP 를 전제로 답했다.
+    #
+    # ■ 맞바꾼 것
+    #   별칭 목록에 없는 표현("회사가 운용하는 거요")은 이제 못 잡는다. 그 대가는
+    #   되묻기가 한 번 더 나가는 것뿐이다. 반대로 환각을 통과시키면 되묻기가 꺼진 채
+    #   틀린 계좌유형으로 단정 답변이 나간다 — 손실이 비교가 안 된다.
     계좌유형 = (res.계좌유형 or "").strip()
     if 계좌유형 not in config.ACCOUNT_VALUES:
         계좌유형 = ""
-    계좌유형 = 계좌유형 or _account_in_question(question)
-    acct_needs = bool(res.계좌유형_필요) and not 계좌유형
+    in_question = _accounts_in_question(question)
+    계좌유형_환각 = bool(계좌유형) and 계좌유형 not in in_question
+    if 계좌유형_환각:
+        계좌유형 = ""
+    if not 계좌유형 and len(in_question) == 1:
+        계좌유형 = in_question[0]      # LLM 이 놓친 것을 목록 대조가 받친다
+    # ── 계좌유형 되묻기 게이트 (2026-08-27, 6차 실행 결과 반영) ──────────
+    #
+    # ■ 무엇이 드러났나
+    #   환각 차단(위)이 의도대로 동작해 계좌유형 오채움이 6→0 이 됐다. 그런데
+    #   그 값들이 그동안 acct_needs 를 **우연히 꺼 주고 있었다.** 차단하고 나니
+    #   가려져 있던 `계좌유형_필요` 과다판정이 그대로 드러나, 되묻기가
+    #   4건 → 9건으로 늘고 그중 8건이 오발동했다.
+    #
+    #     D-D3 "연금수령 3년차인데 얼마까지?"   → 계산을 안 하고 되물음
+    #     D-E1 "명퇴수당 절세법"                → 골드 기대가 "반드시 답변"
+    #     P-G4 "55세 전에 깨면?"                → 제도 청크로 답할 수 있는 질문
+    #     P-H2 "제일 좋은 거 하나만 찍어줘"      → 추천 질문에 중도인출 템플릿이 나감
+    #
+    # ■ 왜 사유 축을 게이트로 쓰나
+    #   코퍼스에서 계좌유형이 답을 가르는 서술은 **중도인출 사유 맥락에 몰려 있다.**
+    #     doc46 "의료비 12.5% 초과 (개인형IRP 는 무관)"
+    #     doc48 "전월세 중도인출은 DC 재직 중 1회, 개인형IRP 는 횟수제한 없음"
+    #   반면 위 4건처럼 수령한도·세제·추천 질문은 계좌유형을 몰라도 답이 선다.
+    #   사유 축이 이미 쓰는 이중 판정과 같은 방식이다 — 튜닝할 숫자가 없고
+    #   LLM 호출도 늘지 않는다.
+    #
+    # ■ 6차 데이터로 본 예상 효과
+    #   계좌유형 축 되묻기 8건 중 D-C3·D-D3·D-E1·P-G4·P-H2 가 꺼진다.
+    #   적중 문항 D-A2(사유_필요=true)는 그대로 남는다.
+    #
+    #   ⚠️ 예전 주석은 "계좌유형은 중도인출뿐 아니라 부담금·수령방법·세제에서도
+    #      답을 가르므로 게이트를 걸지 않는다" 였다. 실측이 그 반대를 가리켜서
+    #      뒤집는다 — 그 범주에서 되묻기가 맞은 문항이 0건이었다.
+    #
+    # ■ 사유가 확정되면 계좌유형은 묻지 않는다 (2026-08-27, 재희님 결정 반영)
+    #   6차 실행에서 게이트를 걸어도 D-C1(요양 서류)·D-C2(신축 서류)가 남았다.
+    #   사유를 이미 알아냈는데 계좌유형을 또 물어 서류 목록을 못 준 경우다.
+    #   여기서 한 발 더 나가면 유일한 적중 문항 D-A2 를 잃지만,
+    #     · 적중 1건 대 오발동 3건
+    #     · 되묻기 오발동은 답을 **아예 안 주는 것**이라 손실이 크다
+    #     · D-E1 은 골드에 "반드시 답변, 거절하면 최하점" 이 달려 있다
+    #   D-A2 하나를 지키려고 3건을 감수할 이유가 없다는 판단이다.
+    #
+    #   결과적으로 계좌유형 되묻기는 "사유도 계좌유형도 모를 때" 만 나간다.
+    #   그때는 계좌유형을 먼저 묻는다 — prompt.py 의 역질문 지침과 같은 순서다.
+    acct_needs = (bool(res.계좌유형_필요) and not 계좌유형
+                  and needs and not 사유)
 
     slots = {
         "사유": 사유,
@@ -187,6 +271,14 @@ def resolve_slots(state: OverallState) -> dict:
         # 두 번 모두 "역질문 0/4"의 원인을 좁히지 못했다. 원값을 남긴다.
         "사유_필요": needs,
         "계좌유형_필요": bool(res.계좌유형_필요),
+
+        # LLM 이 낸 계좌유형을 질문 근거가 없어 버렸다는 표시. 재검증 때
+        # "되묻기가 왜 켜졌나" 를 로그만 보고 구분할 수 있게 남긴다.
+        "계좌유형_환각차단": 계좌유형_환각,
+
+        # 중도인출 질문인가 (사유 축 게이트의 원값). 6차에서 되묻기 오발동을
+        # 분류하려 했을 때 이 값이 없어서 원인을 못 좁혔다.
+        "중도인출_질문": bool(getattr(res, "중도인출_질문", True)),
     }
 
     # 사유가 확정됐으면 소프트 필터로 넘긴다.
@@ -224,7 +316,9 @@ def resolve_slots(state: OverallState) -> dict:
             "slots": slots,
             "llm_calls": 1,
             "trace": step("resolve_slots",
-                          summary=f"계좌유형 미확정 → 역질문 — {res.근거}", ms=t.ms),
+                          summary="계좌유형 미확정 → 역질문"
+                                  + (" (LLM 추측값 폐기)" if 계좌유형_환각 else "")
+                                  + f" — {res.근거}", ms=t.ms),
         }
 
     # ── 사유는 확정됐고 계좌유형은 물을 필요가 없다 → 그대로 진행 ────

@@ -42,7 +42,7 @@ import config
 import edges
 import nodes
 import state
-from utils import step
+from utils import step, truncate
 
 from .rag_core import rag_core
 
@@ -217,7 +217,7 @@ pension_agent = graph.compile()
 # ==========================================================================
 def run(question: str, *, user_profile: Dict[str, Any] | None = None,
         session_id: str = "cli", qkey: str | None = None,
-        reset_usage: bool = True) -> dict:
+        reset_usage: bool = True, follow_up: bool = True) -> dict:
     """질문 하나를 끝까지 처리한다.
 
     반환: OverallState (final_answer, citations, trace, llm_calls, usage …)
@@ -227,26 +227,58 @@ def run(question: str, *, user_profile: Dict[str, Any] | None = None,
       그러면 `result["usage"]` 가 **이 질문 1건이 쓴 토큰**만 담는다.
       여러 질문을 연속 실행할 때(eval)는 `reset_usage=False` 로 두고
       `llm.usage_by_question()` 으로 질문별 내역을 한 번에 꺼낼 수 있다.
+
+    ■ 되묻기 이어받기
+      직전 턴이 되묻기로 끝난 **같은 session_id** 에서 다음 입력이 그 답으로
+      보이면, 원 질문에 붙여 다시 태운다(`workflows/followup.py`).
+      끄려면 `follow_up=False` 또는 `PENSION_CLARIFY_FOLLOWUP=false`.
     """
     from llm import llm
+
+    from . import followup
 
     key = qkey or session_id
     if reset_usage:
         llm.reset_usage()
     llm.mark_question(key)
 
+    # ── 되묻기 이어받기 (2026-08-27) ────────────────────────────────
+    #
+    # 직전 턴이 되묻기로 끝났고 이번 입력이 그 답으로 보이면, 원 질문에 붙여
+    # 하나의 자족적인 문장으로 만든다. 파이프라인은 손대지 않는다.
+    #
+    #   1턴 "의료비가 연봉의 12.5%가 안 되는데 중도인출 되나요?"
+    #       → "DB / DC / 개인형IRP / 연금저축 중 어느 쪽인가요?"
+    #   2턴 "IRP요"
+    #       → "IRP 기준으로 답해 주세요. 의료비가 연봉의 12.5%가 안 되는데…"
+    #
+    # 답이 아니라 새 질문이면 대기 중이던 되묻기는 버린다(주제가 바뀐 것).
+    seed_trace: list = []
+    if config.CLARIFY_FOLLOWUP and follow_up:
+        pend = followup.take(session_id)
+        if pend and followup.looks_like_reply(question):
+            merged = followup.merge(pend["question"], question)
+            seed_trace = step("clarify_followup",
+                              summary=f"되묻기 답변을 원 질문에 합침 — {truncate(merged, 60)}")
+            question = merged
+
     initial: Dict[str, Any] = {
         "session_id": session_id,
         "question": question,
+        "trace": seed_trace,
         "user_profile": user_profile or {},
         "round_no": 0,
         "qa_pairs": [],
         "citations": [],
-        "trace": [],
         "llm_calls": 0,
         "needs_clarification": False,
         "slots": {},
     }
     result = pension_agent.invoke(initial, config={"recursion_limit": 60})
     result["usage"] = llm.usage_for(key)
+
+    # 이번 턴이 되묻기로 끝났으면 다음 입력을 기다린다.
+    if config.CLARIFY_FOLLOWUP and follow_up and result.get("needs_clarification"):
+        followup.remember(session_id, question, result.get("clarification") or "")
+
     return result

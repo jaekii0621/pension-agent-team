@@ -185,6 +185,19 @@ def _cite_rows(cites: List[dict]) -> List[dict]:
             row["fund"] = c["fund_name"]
         if c.get("사유"):
             row["사유"] = c["사유"]
+
+        # ── 인용이 **어느 경로로** 붙었는지 (2026-08-27 신설) ─────────────
+        #   경로가 셋인데 결과 파일에는 구분이 안 남아서, 6차 실행 결과로도
+        #   "P-A4 오출처가 ①이었나 ②였나" 를 특정하지 못했다.
+        #     (없음)   모델이 구조화 출력의 citations 배열에 직접 준 것
+        #     복원     본문에 쓴 [n] 번호에서 되찾은 것 (파싱 실패 시 경로)
+        #     값대조   코드가 수치 일치로 붙인 것
+        #   quote 유무도 같이 남긴다 — 복원 경로는 quote 가 반드시 빈다.
+        if c.get("restored"):
+            row["경로"] = "복원"
+        elif c.get("auto"):
+            row["경로"] = "값대조"
+        row["quote있음"] = bool(c.get("quote"))
         out.append(row)
     return out
 

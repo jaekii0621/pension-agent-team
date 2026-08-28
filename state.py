@@ -230,6 +230,14 @@ class RAGState(TypedDict, total=False):
     citations: List[dict]
     evidence_ok: bool
 
+    # ⚠️ 아래 둘이 없어서 LangGraph 가 값을 버렸다 (2026-08-27 발견).
+    #    TypedDict 에 선언되지 않은 키는 노드가 반환해도 상태에 남지 않는다.
+    #    그래서 6차 결과에서 evidence_sufficient 는 77문항 전부 False,
+    #    unsupported_values 는 전부 빈 배열이었다 — 값이 그런 게 아니라
+    #    전달이 안 된 것이다. 둘 다 진단용으로 일부러 올려보내던 값이다.
+    evidence_sufficient: bool          # 모델이 "근거만으로 답할 수 있다" 고 봤나
+    unsupported_values: List[str]      # 답변이 말했는데 근거에 없는 값 (환각 후보)
+
     # 검증
     verdict: Dict[str, Any]
     verify_retries: int

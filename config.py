@@ -334,6 +334,18 @@ LLM_BACKOFF_MAX = env_float("CLOVA_BACKOFF_MAX", 30.0)
 # 0 이면 쉬지 않는다. 레이트리밋이 잦으면 0.5~2 로 올린다.
 REQUEST_GAP = env_float("PENSION_REQUEST_GAP", 0.0)
 
+# ── 문서 채점 동시 요청 수 (2026-08-27 신설) ──────────────────────────
+#
+# ⚠️ REQUEST_GAP 은 **문항 사이** 간격이라 배치 실행에만 듣는다. 서버는 요청을
+#    하나씩 받으므로 아무 효과가 없다. 6차 실행에서 P-B1 이 429 로 죽은 원인은
+#    문항 사이 간격이 아니라 **질의 하나 안에서 나는 버스트**였다 —
+#    document_grader 가 문서 k개를 8워커로 동시에 채점한다.
+#
+#    평가 시스템이 팀당 순차 1건이어도 이 버스트는 그대로 난다. 서버에서는
+#    이 값을 낮추는 것이 429 를 막는 유일한 손잡이다.
+GRADE_WORKERS = env_int("PENSION_GRADE_WORKERS", 4)
+
+
 # ── 토큰 계측 (CLOVA Tokenizer API) ───────────────────────────────────
 # POST /v1/api-tools/chat-tokenize/{modelName}
 #   요청: {"messages":[{"role":..., "content":...}]}
@@ -697,6 +709,21 @@ REASON_VALUES = ["요양", "파산개인회생", "전세보증금", "주택구�
 
 # 사유를 확정하지 못했을 때 **되묻는다**(역질문). 끄면 사유 없이 그냥 검색한다.
 CLARIFY_MISSING_SLOTS = env_bool("PENSION_CLARIFY", True)
+
+# ── 되묻기 이어받기 (2026-08-27 신설) ──────────────────────────────────
+#
+# 되묻기는 그래프를 끝낸다. 사용자가 "IRP요" 라고 답해도 그 입력은 새 질문으로
+# 처음부터 다시 돌아서, 원래 무엇을 물었는지가 사라진다.
+# true 면 같은 session_id 의 다음 입력이 그 답으로 보일 때 **원 질문에 붙여**
+# 다시 태운다 (workflows/followup.py).
+#
+# ⚠️ 대회 평가는 1요청 1응답이라 여기서는 작동하지 않는다. CLI·노트북·실제
+#    서비스처럼 사람이 다음 턴을 칠 수 있는 곳에서만 의미가 있다.
+#    평가 배치(eval.run_queryset)는 문항마다 session_id 가 달라 영향이 없다.
+CLARIFY_FOLLOWUP = env_bool("PENSION_CLARIFY_FOLLOWUP", True)
+
+# 되묻고 나서 답을 기다리는 시간(초). 지나면 새 질문으로 본다.
+CLARIFY_FOLLOWUP_TTL = env_int("PENSION_CLARIFY_FOLLOWUP_TTL", 900)
 
 # ── 되묻기 두 번째 축: 계좌유형 (2026-08-20 신설) ─────────────────────
 #

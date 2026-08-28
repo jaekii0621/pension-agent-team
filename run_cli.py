@@ -162,12 +162,23 @@ def ask(question: str, profile: dict, *, show_mermaid: bool = False,
 
     result = run(question, user_profile=profile)
 
+    # 직전 되묻기의 답으로 인식해 원 질문에 붙였다면 무엇으로 합쳤는지 보여준다.
+    merged = next((e for e in result.get("trace", [])
+                   if e.get("node") == "clarify_followup"), None)
+    if merged:
+        print(f"\n↩ 직전 되묻기의 답으로 보고 원 질문에 합쳤습니다.")
+
     print("\n" + render_trace(result.get("trace", [])))
 
     print("\n" + "─" * 68)
     print("답변")
     print("─" * 68)
     print(result.get("final_answer") or "(답변 없음)")
+
+    # 되묻기로 끝났으면, 답을 그냥 이어서 치면 된다는 것을 알려 준다.
+    if result.get("needs_clarification"):
+        print("\n↩ 위 질문에 답을 입력하시면 원 질문에 붙여 다시 답변합니다. "
+              "(예: \"IRP요\")")
 
     # ── 이 질문 1건이 쓴 토큰 ────────────────────────────────────────
     u = result.get("usage") or {}
