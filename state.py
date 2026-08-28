@@ -195,6 +195,21 @@ class OverallState(TypedDict, total=False):
     calc_result: Annotated[Dict[str, Any], merge_dict]
     strategy_note: Annotated[Optional[str], keep_last]
 
+    # 답변이 말했는데 근거에 없는 값 — 환각 후보 (2026-08-28)
+    #
+    # ⚠️ RAGState 쪽과 마찬가지로 **여기 선언이 없으면 LangGraph 가 버린다.**
+    #    combine_answer 가 아무리 계산해서 반환해도 상태에 남지 않는다.
+    #
+    #   unsupported_values      최종 답변(재작성 후) 기준 — 이게 판정 대상이다
+    #   unsupported_values_pre  서브답변(재작성 전) 기준 — 예전에 쓰던 값
+    #
+    # 둘을 다 남기는 이유: pre - final = 재작성이 걸러준 값,
+    # final - pre = **재작성이 새로 만들어낸 값**. 후자가 나오면 combiner 가
+    # 값을 지어내고 있다는 뜻이라 더 중요한 신호다. 최종값 하나로 덮어쓰면
+    # 이 구분이 사라진다.
+    unsupported_values: Annotated[Optional[List[str]], keep_last]
+    unsupported_values_pre: Annotated[Optional[List[str]], keep_last]
+
     # --- 검증 ---
     verification: Annotated[Dict[str, Any], merge_dict]
     verify_retries: int

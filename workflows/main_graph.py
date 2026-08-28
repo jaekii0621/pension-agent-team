@@ -73,6 +73,10 @@ def rag_worker(payload: Dict[str, Any]) -> dict:
         "evidence_sufficient": res.get("evidence_sufficient"),
         # 답변이 말했는데 근거에 없는 값 — 환각 후보 (2026-08-23)
         "unsupported_values": res.get("unsupported_values") or [],
+        # 이 서브질문이 실제로 본 근거 청크. combine_answer 가 **최종 답변**을
+        # 같은 근거 집합과 대조하려면 필요하다 (2026-08-28).
+        # 결과 파일에는 안 나간다 — run_queryset 이 qa_pairs 에서 고른 키만 쓴다.
+        "documents": res.get("documents") or [],
         "evidence_ok": res.get("evidence_ok", False),
         "verified": verdict.get("pass", True),
         "score": verdict.get("score"),

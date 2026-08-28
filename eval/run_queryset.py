@@ -193,10 +193,15 @@ def _cite_rows(cites: List[dict]) -> List[dict]:
         #     복원     본문에 쓴 [n] 번호에서 되찾은 것 (파싱 실패 시 경로)
         #     값대조   코드가 수치 일치로 붙인 것
         #   quote 유무도 같이 남긴다 — 복원 경로는 quote 가 반드시 빈다.
+        # 세 경로를 **전부 명시**한다 (2026-08-28). 예전에는 모델직접이
+        # 키 없음으로 저장돼서, 집계할 때 "키 없음 = 모델직접" 이라는 암묵
+        # 규칙을 알아야 했다.
         if c.get("restored"):
             row["경로"] = "복원"
         elif c.get("auto"):
             row["경로"] = "값대조"
+        else:
+            row["경로"] = "모델직접"
         row["quote있음"] = bool(c.get("quote"))
         out.append(row)
     return out
@@ -303,8 +308,22 @@ def run_case(case: dict, *, max_answer: int = 4000) -> Dict[str, Any]:
                                 for p in qa_pairs],
 
         # 서브답변들의 '근거 없는 값' 을 문항 단위로 모은다 (2026-08-23)
-        "unsupported_values": sorted({v for p in qa_pairs
-                                     for v in (p.get("unsupported_values") or [])}),
+        # ── 근거 없는 값 — 재작성 전/후를 **둘 다** 남긴다 (2026-08-28) ──
+        #
+        #   unsupported_values      최종 답변 기준. 판정할 가치가 있는 목록
+        #   unsupported_values_pre  서브답변 기준. 예전에 쓰던 값
+        #   unsupported_values_new  final - pre = 재작성이 새로 만든 값
+        #
+        # 예전에는 pre 만 기록하면서 이름을 `unsupported_values` 로 달아, 최종
+        # 답변에 없는 문자열을 환각으로 판정할 뻔했다(7차 P-B3·P-D5).
+        #
+        # ⚠️ `_new` 를 곧바로 환각으로 읽지 마라. 재작성이 표기를 바꾼 것
+        #    ("12.5%" → "12.5퍼센트")도 여기 들어온다. 건수부터 본다.
+        "unsupported_values": result.get("unsupported_values") or [],
+        "unsupported_values_pre": result.get("unsupported_values_pre") or [],
+        "unsupported_values_new": sorted(
+            set(result.get("unsupported_values") or [])
+            - set(result.get("unsupported_values_pre") or [])),
 
         # --- 실행 경로·비용 ---
         "path": _trace_path(trace),
@@ -337,7 +356,8 @@ COMPACT_KEYS = [
 
     # --- 근거 (검색 실패인지 인용 실패인지 갈리려면 둘 다 필요) ---
     "n_citations", "cite_dist", "retrieval_dist", "dangling_cites",
-    "unsupported_values", "evidence_sufficient", "salvage",
+    "unsupported_values", "unsupported_values_pre", "unsupported_values_new",
+    "evidence_sufficient", "salvage",
     "citations", "retrieval",
 
     # --- 계산 (산술 오류의 원인이 도구인지 LLM 암산인지) ---

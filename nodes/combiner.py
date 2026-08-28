@@ -25,6 +25,7 @@ from typing import Dict, List, Tuple
 
 import config
 from llm import llm
+from nodes.answer_generator import attach_citations_by_value
 from prompt import prompts
 from state import OverallState
 from utils import Timer, step
@@ -136,6 +137,12 @@ def _format_sources(cites: List[dict]) -> str:
     return "\n".join(lines)
 
 
+def _pre_unsupported(qa_pairs: List[dict]) -> List[str]:
+    """재작성 **전** 서브답변들이 남긴 근거 없는 값의 합집합."""
+    return sorted({v for p in qa_pairs
+                   for v in (p.get("unsupported_values") or [])})
+
+
 def combine_answer(state: OverallState) -> dict:
     """모든 결과를 하나의 최종 답변으로."""
     question = state["question"]
@@ -173,6 +180,9 @@ def combine_answer(state: OverallState) -> dict:
                 "제공된 자료에서 이 질문에 답할 근거를 찾지 못했습니다.\n\n"
                 "정확한 내용은 가입하신 금융기관이나 관할 기관에 확인해 주세요.",
             "citations": [],
+            # 값을 말하지 않는 고정 문구라 근거 없는 값도 없다.
+            "unsupported_values": [],
+            "unsupported_values_pre": _pre_unsupported(qa_pairs),
             "trace": step("combine_answer",
                           summary=f"근거 0건 — 합성 생략 (서브답변 {len(qa_pairs)}건)"),
         }
@@ -258,14 +268,52 @@ def combine_answer(state: OverallState) -> dict:
     if dangling:
         log.warning("출처 목록에 없는 인용 번호를 제거했습니다: %s", sorted(set(dangling)))
 
+    # ── 근거 없는 값을 **최종 답변** 기준으로 다시 센다 (2026-08-28) ────
+    #
+    # ■ 무엇이 잘못됐었나
+    #   `unsupported_values` 는 generate_answer 가 **서브답변**을 보고 계산한
+    #   값이었다. 그런데 최종 답변은 여기서 LLM 이 다시 쓴 별도 텍스트다.
+    #   그래서 결과 파일의 값은 사용자가 실제로 받는 답변과 무관했다.
+    #
+    #   실측(7차): P-B3 는 "3등급" 이 근거 없는 값으로 기록됐는데 최종 답변에는
+    #   그 문자열이 아예 없다 — 재작성 과정에서 사라진 값을 놓고 환각이라고
+    #   판정할 뻔했다. P-D5 도 같은 형태였다.
+    #
+    # ■ 왜 둘 다 남기나
+    #   pre - final  : 재작성이 걸러 준 값
+    #   final - pre  : **재작성이 새로 만들어낸 값** ← 이쪽이 더 위험하다
+    #   최종값으로 덮어쓰면 후자를 영영 못 본다. 지금 구조에서는 combiner 가
+    #   값을 지어내도 아무 데도 안 남는다.
+    #
+    #   ⚠️ final - pre 가 곧 환각은 아니다. 서브답변에 근거 있게 있던 값을
+    #      재작성이 다른 표기로 바꾸면("12.5%" → "12.5퍼센트") 문자열 대조가
+    #      안 걸려 여기 들어온다. 건수가 실제로 얼마나 나오는지 먼저 보고
+    #      판단한다 — 지금 임계값이나 룰을 만들지 않는다.
+    #
+    # ■ 비용 0 — 이미 있는 함수를 문자열 대조로만 쓴다. LLM 호출 없음.
+    #   대조 대상은 본문(body+tail)이다. 출처 목록은 문서 ID·페이지라
+    #   답변이 말한 값이 아니다.
+    seen, ordered = set(), []
+    for p in rebuilt:
+        for ch in (p.get("documents") or []):
+            cid = ch.get("chunk_id")
+            if cid and cid not in seen:
+                seen.add(cid)
+                ordered.append(ch)
+    _, unsupported = attach_citations_by_value(body + tail, ordered, [])
+
     return {
         "final_answer": final,
         "citations": global_cites,
         "dangling_cites": sorted(set(dangling)),
+        "unsupported_values": unsupported,
+        "unsupported_values_pre": _pre_unsupported(qa_pairs),
         "llm_calls": used_llm,
         "trace": step("combine_answer",
                       summary=f"LLM 합성 — 서브답변 {len(rebuilt)}건 + 출처 "
-                              f"{len(global_cites)}건 → {len(final)}자{cite_note}",
+                              f"{len(global_cites)}건 → {len(final)}자{cite_note}"
+                              + (f", 근거없는 값 {len(unsupported)}개"
+                                 if unsupported else ""),
                       ms=ms),
     }
 

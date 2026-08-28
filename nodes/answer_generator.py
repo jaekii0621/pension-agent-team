@@ -117,8 +117,15 @@ _TOK_HIGH = [
     #    C-P2I … 글자와 숫자가 섞이므로 통째로 잡아야 잘림이 안 생긴다.
     re.compile(r"(?<![A-Za-z0-9])C-[A-Za-z0-9]{1,4}(?![A-Za-z0-9])"),  # C-P · C-P2e
     re.compile(r"(?<![A-Za-z0-9])CRP\d?(?![A-Za-z0-9])"),             # CRP
-    re.compile(r"(?:위험)?등급\s*[1-6]|[1-6]\s*등급"),    # 등급 5 · 5등급
 ]
+
+# 등급은 표기가 두 가지라 **뽑은 뒤 한 모양으로 맞춘다** (2026-08-28).
+#   답변  "위험등급은 2등급입니다"  → 2등급
+#   카드  "위험등급 2등급"          → 위험등급2   ← 예전엔 이렇게 갈렸다
+# 값이 같은데 교집합이 비어서 근거 있는 등급이 '근거 없는 값' 으로 잡혔다
+# (7차 P-A1 의 '2등급'·'5등급' 이 이 경우로 보인다).
+# 부분문자열 대조 때는 우연히 걸렸고, 토큰 교집합으로 바꾸면서 드러났다.
+_TOK_GRADE = re.compile(r"(?:위험)?등급\s*([1-6])|([1-6])\s*등급")
 _TOK_LOW = [
     re.compile(r"\d+\s*개월"),                         # 3개월
     re.compile(r"\d+\s*년"),                           # 20년
@@ -163,6 +170,9 @@ def _norm(v: str) -> str:
 def _tokens(text: str):
     """(높은 특이도 집합, 낮은 특이도 집합)"""
     hi = {_norm(m.group(0)) for p in _TOK_HIGH for m in p.finditer(text or "")}
+    # 등급은 어느 표기로 쓰였든 "N등급" 하나로 모은다.
+    hi |= {(m.group(1) or m.group(2)) + "등급"
+           for m in _TOK_GRADE.finditer(text or "")}
     lo = {_norm(m.group(0)) for p in _TOK_LOW for m in p.finditer(text or "")}
     return hi, lo - hi
 
