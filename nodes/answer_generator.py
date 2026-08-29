@@ -309,10 +309,34 @@ def generate_answer(state: RAGState) -> dict:
         f"[근거]\n{context}"
     )
 
+    # ── 구제 경로를 탔는지 표시해 둔다 (2026-08-29) ───────────────────
+    #
+    # ■ 무엇이 조용히 망가지고 있었나
+    #   GeneratedAnswer 는 `citations` 에 default_factory=list, `evidence_sufficient`
+    #   에 default=True 가 걸려 있다. 그래서 clova_client 가 구조화 파싱에 실패해
+    #   원문을 main_answer 에 담아 구제하면(_salvage_text), 나머지 두 필드는
+    #   **기본값으로 채워진 채 Pydantic 검증을 통과한다.**
+    #
+    #       citations          = []     ← 인용을 못 뽑은 게 아니라 '없다'고 기록됨
+    #       evidence_sufficient = True  ← 파싱이 실패했는데 '근거 충분'이라고 기록됨
+    #
+    #   예외도 경고도 안 난다. 파싱 실패가 "인용 0건인 정상 답변" 으로 둔갑한다.
+    #   특히 표를 요구하는 문항에서 모델이 JSON 대신 마크다운 표를 내면
+    #   중괄호가 없어 복구 호출조차 건너뛴다(clova_client 의 'json_없음' 경로).
+    #
+    # ■ 왜 스키마에서 기본값을 빼지 않았나
+    #   `citations` 를 필수로 만들면 _free_text_field 가 자유서술형 판정을 안 하게
+    #   되고, 구제 경로 자체가 막혀 **파싱 실패한 서브질문이 통째로 죽는다.**
+    #   그 실패는 이미 겪었다(1차 실행 6건 유실) — 그래서 구제는 그대로 두고
+    #   **구제였다는 사실만 신호로 남긴다.**
+    n_salvage_before = len(llm.salvages)
+
     with Timer() as t:
         res = llm.structured(system, user, GeneratedAnswer,
                              model=config.MODEL_ANSWER, max_tokens=2000,
                              stage=f"answer:{mode}")
+
+    salvaged = len(llm.salvages) > n_salvage_before
 
     # 인용 번호 → 실제 청크
     cites: List[dict] = []
@@ -393,11 +417,14 @@ def generate_answer(state: RAGState) -> dict:
         #   sufficient=False → 모델이 "답할 근거가 없다"고 판단   → 답변 프롬프트 문제
         #   sufficient=True + 인용 0 → 근거는 있는데 표기만 안 함 → 인용 규칙 문제
         # 고칠 곳이 정반대라, 원값을 따로 올려보낸다 (2026-08-20).
-        "evidence_sufficient": bool(res.evidence_sufficient),
-        "evidence_ok": bool(res.evidence_sufficient and cites),
+        # 구제 경로를 탔으면 evidence_sufficient 는 모델의 판단이 아니라 스키마
+        # 기본값(True)이다. 판단한 적이 없으므로 '충분' 으로 세면 안 된다.
+        "evidence_sufficient": bool(res.evidence_sufficient) and not salvaged,
+        "evidence_ok": bool(res.evidence_sufficient and cites) and not salvaged,
         "llm_calls": 1,
         "trace": step("generate_answer", qid=qid,
                       summary=f"[{mode}] {len(res.main_answer)}자, 인용 {len(cites)}건"
+                          + (" ⚠구제경로(파싱실패)" if salvaged else "")
                               + (f"(자동 {sum(1 for c in cites if c.get('auto'))})"
                                  if any(c.get("auto") for c in cites) else "")
                               + (f"(본문복원 {sum(1 for c in cites if c.get('restored'))})"

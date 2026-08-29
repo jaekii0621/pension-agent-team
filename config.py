@@ -437,6 +437,20 @@ EMBED_MEMORY_GUARD = env_bool("PENSION_EMBED_MEMORY_GUARD", True)
 # 캐시 파일명에 쓸 안전한 슬러그 ("intfloat/multilingual-e5-large" → "multilingual-e5-large")
 EMBED_SLUG = EMBED_MODEL.split("/")[-1].replace(":", "-")
 
+# ── 질의 임베딩을 못 만들 때 멈출 것인가 (2026-08-29) ──────────────────
+#
+# 기본(False): 질의 임베딩에 실패하면 조용히 BM25 단독으로 떨어진다.
+#   서빙 중에는 이게 맞다 — 검색이 아예 멈추는 것보다 낫다.
+#
+# True: 예외를 그대로 올린다. **평가를 돌릴 때 켜라.**
+#   일부 질의만 벡터검색을 타고 나머지는 BM25 단독이 되면 점수는 내려가는데
+#   기록에는 아무 차이도 안 남는다. 원인을 구분할 수 없는 결과가 나오느니
+#   멈추는 편이 낫다.
+#
+# 모델을 못 올리는 환경(메모리 부족)에서는 질의 캐시
+# `cache/emb_query_{EMBED_SLUG}.jsonl` 를 미리 구워 두면 모델 없이 돈다.
+EMBED_STRICT = env_bool("PENSION_EMBED_STRICT", False)
+
 # ── 벡터 아티팩트: 빌드 단계와 서빙 단계의 경계 ───────────────────────
 #
 #   [빌드]  python -m index.build_index   → cache/index_<슬러그>/ 에 벡터 저장
