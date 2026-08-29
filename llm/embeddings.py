@@ -125,7 +125,7 @@ class E5Embedder:
         self._mem: dict[str, List[float]] = {}
         self._model = None                 # 지연 로딩 (모델 로드가 수 초 걸린다)
         self._load_failed = False
-        self._loaded_files: set[Path] = set()   # 이미 메모리에 올린 캐시 파일들
+        self._cache_loaded = False         # 디스크 캐시는 **빌드 단계에서만** 올린다
 
     # ------------------------------------------------------------ 단계 분리
     #
@@ -195,27 +195,14 @@ class E5Embedder:
     # ---------------------------------------------------------------- 캐시
     @property
     def _cache_file(self) -> Path:
-        """문서(빌드) 캐시. 청크 수천 건 규모 — 수백 MB 다."""
         return self.cache_dir / f"emb_{config.EMBED_SLUG}.jsonl"
 
-    @property
-    def _query_cache_file(self) -> Path:
-        """질의(서빙) 캐시 — 문서 캐시와 **반드시 분리한다** (2026-08-29).
-
-        질의 임베딩을 미리 구워 두면 모델 없이도 벡터검색이 돈다. 그런데 같은
-        파일에 담으면 질의 하나를 찾으려고 문서 수천 건을 통째로 메모리에 올려야
-        한다. e5-large 를 못 올리는 환경은 애초에 메모리가 모자란 환경이라
-        (실측 이 PC: 총 3.9GB / 여유 0.3GB) 그 로드에서 그냥 죽는다.
-        질의 캐시는 질의 수만큼만 커진다(문항 78 + 서브질문 + HyDE ≈ 수백 건).
-        """
-        return self.cache_dir / f"emb_query_{config.EMBED_SLUG}.jsonl"
-
-    def _load_cache(self, path=None) -> None:
+    def _load_cache(self) -> None:
         """디스크 캐시를 메모리로 올린다. **빌드 단계에서만** 호출된다."""
-        f = path or self._cache_file
-        if f in self._loaded_files:
+        if self._cache_loaded:
             return
-        self._loaded_files.add(f)
+        self._cache_loaded = True
+        f = self._cache_file
         if not f.exists():
             return
         n = 0
@@ -229,13 +216,12 @@ class E5Embedder:
                 n += 1
             except Exception:
                 continue
-        log.info("임베딩 캐시 %d건 로드 (%s)", n, f.name)
+        log.info("임베딩 캐시 %d건 로드", n)
 
-    def _append_cache(self, pairs: List[tuple[str, List[float]]],
-                      path=None) -> None:
+    def _append_cache(self, pairs: List[tuple[str, List[float]]]) -> None:
         if not pairs:
             return
-        with (path or self._cache_file).open("a", encoding="utf-8") as fp:
+        with self._cache_file.open("a", encoding="utf-8") as fp:
             for h, vec in pairs:
                 fp.write(json.dumps({"h": h, "v": vec}) + "\n")
 
@@ -245,20 +231,20 @@ class E5Embedder:
 
     # ---------------------------------------------------------------- 계산
     def _encode(self, prefixed: List[str], *,
-                cache_file=None) -> List[List[float]]:
+                use_disk_cache: bool) -> List[List[float]]:
         """배치 인코딩한다. 입력은 **접두사가 이미 붙은** 문자열.
 
-        `cache_file` 로 어느 디스크 캐시를 쓸지 고른다.
-          _cache_file       (빌드) : 문서 캐시. 청크 몇 개만 바뀌면 그것만 재계산.
-          _query_cache_file (서빙) : 질의 캐시. 미리 구워 두면 모델 없이 돈다.
-          None                     : 프로세스 안 메모리 캐시만 쓴다.
+        `use_disk_cache` 가 두 단계를 가른다.
+          True  (빌드) : 디스크 캐시를 읽고 새로 계산한 것을 덧붙인다.
+                         청크 몇 개만 바뀌었을 때 그것만 다시 계산하기 위한 것.
+          False (서빙) : 프로세스 안 메모리 캐시만 쓴다. 질의는 매번 다르고
+                         재사용되지 않아서, 디스크에 쌓아 봐야 파일만 커진다.
         """
         # ⚠️ 모델 로드는 **캐시 미스가 있을 때만** 한다 (2026-08-29).
-        #    예전에는 맨 앞에서 무조건 _ensure_model() 을 불러서, 캐시가 100%
-        #    맞아떨어져도 모델을 못 올리는 환경이면 EmbeddingError 로 떨어졌다.
-        #    질의를 미리 구워 두는 전략 자체가 성립하지 않았다.
-        if cache_file is not None:
-            self._load_cache(cache_file)
+        #    예전에는 맨 앞에서 무조건 _ensure_model() 을 불렀다. 캐시가 100%
+        #    맞아떨어지는 재빌드에서도 2.2GB 를 올리고 시작한 셈이다.
+        if use_disk_cache:
+            self._load_cache()
 
         hashes = [self._hash(t) for t in prefixed]
         todo_idx = [i for i, h in enumerate(hashes) if h not in self._mem]
@@ -282,8 +268,8 @@ class E5Embedder:
                 lst = [float(x) for x in v]
                 self._mem[hashes[i]] = lst
                 fresh.append((hashes[i], lst))
-            if cache_file is not None:
-                self._append_cache(fresh, cache_file)
+            if use_disk_cache:
+                self._append_cache(fresh)
 
         return [self._mem[h] for h in hashes]
 
@@ -294,28 +280,14 @@ class E5Embedder:
         서빙 단계에서 모델이 필요한 곳은 **여기 하나뿐이다.** 문서는 빌드 단계가
         이미 인코딩해 아티팩트로 저장해 뒀다.
         """
+        if not self.enabled:
+            return None
         text = (text or "").strip()
         if not text:
             return None
         try:
-            # 캐시를 **먼저** 본다. 미리 구워 둔 질의면 모델을 안 건드린다.
-            # 기본은 메모리 캐시만(cache_file=None) — 모델이 도는 환경에서는
-            # 디스크에 쌓아 봐야 파일만 커진다.
-            return self._encode(
-                [config.EMBED_QUERY_PREFIX + text],
-                cache_file=(self._query_cache_file
-                            if config.EMBED_QUERY_CACHE else None))[0]
-        except EmbeddingError as e:
-            # 캐시에도 없고 모델도 못 쓴다 → BM25 단독으로 떨어진다.
-            #
-            # ⚠️ 평가 중이라면 이 조용한 강등이 **결과를 못 쓰게 만든다.**
-            #    일부 질의만 벡터검색을 타고 나머지는 BM25 단독이 되는데 기록에는
-            #    아무 차이도 안 남아서, 점수가 내려가도 원인을 구분할 수 없다.
-            #    PENSION_EMBED_STRICT=true 면 조용히 넘기지 않고 멈춘다.
-            if config.EMBED_STRICT:
-                raise
-            log.warning("질의 임베딩 불가(%s) → BM25 단독", e)
-            return None
+            return self._encode([config.EMBED_QUERY_PREFIX + text],
+                                use_disk_cache=False)[0]
         except Exception as e:
             log.warning("질의 임베딩 실패(%s) → BM25 단독", e)
             return None
@@ -329,7 +301,7 @@ class E5Embedder:
         try:
             if progress:
                 print(f"  임베딩 {len(prefixed)}건 (모델={self.model_name})")
-            return np.array(self._encode(prefixed, cache_file=self._cache_file),
+            return np.array(self._encode(prefixed, use_disk_cache=True),
                             dtype="float32")
         except Exception as e:
             log.warning("문서 임베딩 실패: %s", e)
