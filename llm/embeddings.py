@@ -299,8 +299,12 @@ class E5Embedder:
             return None
         try:
             # 캐시를 **먼저** 본다. 미리 구워 둔 질의면 모델을 안 건드린다.
-            return self._encode([config.EMBED_QUERY_PREFIX + text],
-                                cache_file=self._query_cache_file)[0]
+            # 기본은 메모리 캐시만(cache_file=None) — 모델이 도는 환경에서는
+            # 디스크에 쌓아 봐야 파일만 커진다.
+            return self._encode(
+                [config.EMBED_QUERY_PREFIX + text],
+                cache_file=(self._query_cache_file
+                            if config.EMBED_QUERY_CACHE else None))[0]
         except EmbeddingError as e:
             # 캐시에도 없고 모델도 못 쓴다 → BM25 단독으로 떨어진다.
             #

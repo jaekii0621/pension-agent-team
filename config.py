@@ -451,6 +451,20 @@ EMBED_SLUG = EMBED_MODEL.split("/")[-1].replace(":", "-")
 # `cache/emb_query_{EMBED_SLUG}.jsonl` 를 미리 구워 두면 모델 없이 돈다.
 EMBED_STRICT = env_bool("PENSION_EMBED_STRICT", False)
 
+# ── 질의 임베딩을 디스크에 쌓을 것인가 (기본 끔) ──────────────────────
+#
+# 끔(기본): 프로세스 안 메모리 캐시만 쓴다. 질의는 매번 달라 재사용되지 않으므로
+#   디스크에 쌓아 봐야 파일만 커진다. 콜랩처럼 모델이 정상 로드되는 환경의 기본값.
+#
+# 켬: cache/emb_query_{EMBED_SLUG}.jsonl 에 읽고 쓴다.
+#   **모델을 못 올리는 환경에서 벡터검색을 살리는 용도다.**
+#   모델이 도는 환경에서 한 번 켜고 돌려 캐시를 데운 뒤, 그 파일을 못 도는
+#   환경으로 옮기면 모델 없이 같은 검색이 재현된다.
+#   ⚠️ 검색에 들어가는 건 원 질문이 아니라 분해기가 런타임에 만든 서브질문·
+#      HyDE 텍스트다. 질의 목록만 따로 임베딩하지 말고 파이프라인 전체를
+#      돌려서 데워야 한다. 커버리지 확인은 PENSION_EMBED_STRICT=true 로.
+EMBED_QUERY_CACHE = env_bool("PENSION_EMBED_QUERY_CACHE", False)
+
 # ── 벡터 아티팩트: 빌드 단계와 서빙 단계의 경계 ───────────────────────
 #
 #   [빌드]  python -m index.build_index   → cache/index_<슬러그>/ 에 벡터 저장
