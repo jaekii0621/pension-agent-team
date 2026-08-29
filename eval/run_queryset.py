@@ -624,6 +624,9 @@ def main() -> int:
             "use_confidence": config.USE_CONFIDENCE_WEIGHT,
             "models": {"plan": config.MODEL_PLAN, "grade": config.MODEL_GRADE,
                        "answer": config.MODEL_ANSWER, "verify": config.MODEL_VERIFY,
+                       "decompose": config.MODEL_DECOMPOSE,
+                       "safety": config.MODEL_SAFETY,
+                       "repair": config.MODEL_REPAIR,
                        "embed": config.EMBED_MODEL},
         },
     }

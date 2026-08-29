@@ -319,6 +319,36 @@ MODEL_GRADE = env("CLOVA_MODEL_GRADE", "HCX-DASH-002")    # 문서 관련성 채
 MODEL_ANSWER = env("CLOVA_MODEL_ANSWER", "HCX-005")       # 답변 생성·전략·합성
 MODEL_VERIFY = env("CLOVA_MODEL_VERIFY", "HCX-005")       # 환각·품질 검증
 
+# ── (A) 중에서 다시 끌어올린 세 자리 (2026-08-29) ─────────────────────
+#
+# 위 (A)/(B) 이분법은 "출력이 짧으면 DASH" 였는데, 짧은 출력이라고 다 같지 않다.
+# **틀렸을 때 문항 하나가 통째로 망가지는** 자리가 (A) 안에 섞여 있었다.
+# 호출 수가 적어 지연·레이트리밋 부담은 거의 없으므로 셋만 HCX-005 로 올린다.
+#
+#   MODEL_DECOMPOSE  질문 분해. 질문당 1~2회.
+#       분해가 어긋나면 그 아래 검색·채점·생성이 전부 엉뚱한 것을 푼다.
+#       뒤 단계가 아무리 좋아도 복구되지 않는 유일한 자리다.
+#
+#   MODEL_SAFETY     안전성 범주 판정. 질문당 1회.
+#       범주가 곧 출력 문구를 가른다(prompt.CAUTION_GUIDANCE / blocked_messages).
+#       '프롬프트공격' 을 놓치면 평가지표 6번 대응 문장이 아예 안 나간다.
+#
+#   MODEL_REPAIR     구조화 출력 복구 호출. 파싱이 실패했을 때만 돈다.
+#       ⚠️ 여기가 실패하면 `citations` 배열이 통째로 빈다 — 즉 근거표시 0건.
+#       예전엔 MODEL_PLAN 고정이라, HCX-005 가 실패한 JSON 을 DASH 에게
+#       고쳐 달라고 보내는 모양이었다.
+#       ※ 단, 응답에 중괄호가 하나도 없으면 복구 호출 자체를 건너뛴다
+#         (clova_client 의 'json_없음' 경로). 그 경우는 이 상수와 무관하다.
+MODEL_DECOMPOSE = env("CLOVA_MODEL_DECOMPOSE", "HCX-005")  # 질문 분해
+MODEL_SAFETY = env("CLOVA_MODEL_SAFETY", "HCX-005")        # 안전성 범주 판정
+MODEL_REPAIR = env("CLOVA_MODEL_REPAIR", "HCX-005")        # 구조화 출력 복구
+
+# 문서 채점(MODEL_GRADE)은 DASH 로 남겼다.
+#   질문당 최대 8회를 GRADE_WORKERS 만큼 **동시에** 쏘는 유일한 자리라,
+#   여기를 올리면 6차에서 P-B1 을 죽인 429 버스트가 그대로 재현된다.
+#   올려서 보려면 동시성을 함께 내려라:
+#       CLOVA_MODEL_GRADE=HCX-005 PENSION_GRADE_WORKERS=2
+
 LLM_TIMEOUT = env_float("CLOVA_TIMEOUT", 60.0)
 LLM_MAX_RETRY = env_int("CLOVA_MAX_RETRY", 4)     # HTTP 레벨 재시도
 LLM_TEMPERATURE = env_float("CLOVA_TEMPERATURE", 0.0)

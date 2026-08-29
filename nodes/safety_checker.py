@@ -245,7 +245,7 @@ def check_safety(state: OverallState) -> dict:
             prompts.safety_system,
             f"질문: {question}",
             SafetyCheck,
-            model=config.MODEL_PLAN,
+            model=config.MODEL_SAFETY,
             stage="safety",
         )
 

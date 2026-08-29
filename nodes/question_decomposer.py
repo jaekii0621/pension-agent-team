@@ -148,7 +148,7 @@ def decompose_question(state: OverallState) -> dict:
             f"질문: {question}\n"
             f"참고 - 질문유형: {state.get('질문유형')}",
             Decomposition,
-            model=config.MODEL_PLAN,
+            model=config.MODEL_DECOMPOSE,
             stage="decompose",
         )
 
@@ -233,7 +233,7 @@ def decompose_residual(state: OverallState) -> dict:
             f"이미 답을 얻은 서브질문들:\n{answered}\n\n"
             f"부족하다고 판정된 부분: {state.get('residual_question', '(미지정)')}",
             Decomposition,
-            model=config.MODEL_PLAN,
+            model=config.MODEL_DECOMPOSE,
             stage="decompose_residual",
         )
 

@@ -334,12 +334,12 @@ class ClovaLLM:
             f"[잘못된 출력]\n{text[:2000]}"
         )
         t0 = time.time()
-        data = self._post(config.MODEL_PLAN,
+        data = self._post(config.MODEL_REPAIR,
                           [{"role": "system", "content": "너는 JSON 형식 교정기다."},
                            {"role": "user", "content": repair_user}],
                           max_tokens, 0.0)
         text2, i2, o2 = self._parse(data)
-        self._log(stage + ":repair", config.MODEL_PLAN, i2, o2, t0, 0)
+        self._log(stage + ":repair", config.MODEL_REPAIR, i2, o2, t0, 0)
         obj = _try_parse(text2, schema)
         if obj is not None:
             return obj
