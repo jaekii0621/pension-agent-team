@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-
+from llm.embeddings import get_embedder
 from workflows import run as run_agent  # main_graph.run
 
 logging.basicConfig(level=logging.INFO)
@@ -116,8 +116,8 @@ async def answer(
 @app.get("/health")
 async def health():
     """배포 확인용 — 대회 스펙 아님, 트러블슈팅 편의를 위해 추가."""
-    return {"status": "ok"}
-
+    return {"status": "ok", "embeddings": get_embedder().probe()}
+    
 
 if __name__ == "__main__":
     import uvicorn
