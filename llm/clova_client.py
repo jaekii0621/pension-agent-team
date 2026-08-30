@@ -46,6 +46,7 @@ import json
 import logging
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -142,6 +143,14 @@ class ClovaLLM:
         return msg, usage.get("promptTokens", 0), usage.get("completionTokens", 0)
     # ---------------------------------------------------------------------
 
+    # ── 동시 요청 상한 (2026-08-29) ──────────────────────────────────
+    #
+    # 서브질문 fan-out(최대 4) × 채점 워커(4) = 순간 16 요청이 가능했다.
+    # 여기 하나만 막으면 채점·검증·합성까지 전부 걸린다.
+    # 프로세스 전체가 공유하므로 클래스 변수로 둔다.
+    _gate = (threading.BoundedSemaphore(config.LLM_MAX_CONCURRENCY)
+             if config.LLM_MAX_CONCURRENCY > 0 else None)
+
     def _request(self, url: str, payload: dict, *, timeout: float,
                  retries: int) -> Dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -152,8 +161,16 @@ class ClovaLLM:
             req = urllib.request.Request(
                 url, data=body, headers=self._headers(rid), method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    return json.loads(r.read().decode("utf-8"))
+                # ⚠️ 상한은 **실제 호출 구간에만** 건다. 아래 재시도 대기(sleep)는
+                #    이 밖에서 하므로, 백오프로 자는 스레드가 자리를 붙들지 않는다.
+                if self._gate is not None:
+                    self._gate.acquire()
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout) as r:
+                        return json.loads(r.read().decode("utf-8"))
+                finally:
+                    if self._gate is not None:
+                        self._gate.release()
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "ignore")[:400]
                 if e.code in (401, 403):

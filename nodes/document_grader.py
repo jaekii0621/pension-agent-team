@@ -30,7 +30,9 @@ from state import RAGState
 from utils import Timer, log_message, step, truncate
 
 # 채점에 LLM 을 쓸 최대 문서 수 (그 아래 순위는 검색 점수를 신뢰)
-GRADE_LIMIT = 8
+# 서버에서 채점 요청량 자체를 줄일 수 있게 env 로 뺀다 (2026-08-29, 재희님 요청).
+# 기본값 8 그대로라 동작은 바뀌지 않는다.
+GRADE_LIMIT = config.env_int("PENSION_GRADE_LIMIT", 8)
 
 
 class DocumentGrade(BaseModel):

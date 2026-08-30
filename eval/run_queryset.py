@@ -207,7 +207,10 @@ def _cite_rows(cites: List[dict]) -> List[dict]:
     return out
 
 
-def run_case(case: dict, *, max_answer: int = 4000) -> Dict[str, Any]:
+# 4000 → 8000 (2026-08-28). P-A4 처럼 표가 긴 답변이 기록 단계에서 잘려
+# 분석 때 뒷부분을 못 봤다. 이건 모델 출력 한도가 아니라 **결과 파일 기록**
+# 한도라, 올려도 파이프라인 동작은 그대로다.
+def run_case(case: dict, *, max_answer: int = 8000) -> Dict[str, Any]:
     """질의 1건을 파이프라인에 태우고 분석에 필요한 것을 전부 남긴다."""
     from llm import llm            # 구제 경로 기록을 읽는다 (아래 salvage)
     from workflows import run
@@ -561,7 +564,7 @@ def main() -> int:
     ap.add_argument("--qid", default="", help="쉼표로 구분한 qid 목록")
     ap.add_argument("--tag", default="queryset", help="결과 파일 이름표")
     ap.add_argument("--queryset", default=None, help="질의 세트 경로")
-    ap.add_argument("--max-answer", type=int, default=4000,
+    ap.add_argument("--max-answer", type=int, default=8000,
                     help="기록에 남길 답변 최대 길이 (0=자르지 않음)")
     ap.add_argument("--resume", action="store_true",
                     help="같은 tag 의 최신 기록에 있는 문항은 건너뛴다")
