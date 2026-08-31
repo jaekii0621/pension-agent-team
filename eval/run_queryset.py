@@ -203,6 +203,22 @@ def _cite_rows(cites: List[dict]) -> List[dict]:
         else:
             row["경로"] = "모델직접"
         row["quote있음"] = bool(c.get("quote"))
+
+        # ── quote **원문**을 남긴다 (2026-08-31 신설, 9차 이슈 4) ──────────
+        #
+        # `attach_citations_by_value` 는 인용에 어떤 값이 걸려서 붙었는지를
+        # `quote="값 일치: C-e"` 형태로 적어 둔다. 그런데 결과 파일에는
+        # `quote있음: true` 라는 불리언만 남고 **텍스트가 통째로 사라졌다.**
+        # compact 뿐 아니라 full json 에서도 없었다.
+        #
+        # 이게 남아 있었으면 P-E5 에서 `"값 일치: C-e"` 가 그대로 보여 값 대조
+        # 오탐을 즉시 알 수 있었다. 실제로는 인용된 청크 3건을 손으로 대조해
+        # 역산해야 했고, "클래스코드 매칭이 다른 문항에서는 정당했는지" 는
+        # 집계 자체가 불가능했다.
+        #
+        # 값 대조 인용의 진단 정보는 이 한 줄이 전부다. 길이만 자른다.
+        if c.get("quote"):
+            row["quote"] = truncate(c["quote"], 100)
         out.append(row)
     return out
 
@@ -328,6 +344,23 @@ def run_case(case: dict, *, max_answer: int = 8000) -> Dict[str, Any]:
             set(result.get("unsupported_values") or [])
             - set(result.get("unsupported_values_pre") or [])),
 
+        # ── 값 대조가 못 잡는 두 유형 (2026-08-31, 9차 이슈 1·6-b) ────────
+        #   unknown_funds       코퍼스에 없는 자리표시자 상품명
+        #   asset_claim_facts   답변 서술과 어긋나는 카드 사실
+        #   all_subs_unverified 서브답변이 전부 검증에 떨어졌나
+        # 셋 다 문자열 대조로 계산한다 — LLM 호출이 늘지 않는다.
+        "unknown_funds": result.get("unknown_funds") or [],
+        "asset_claim_facts": result.get("asset_claim_facts") or [],
+        "all_subs_unverified": bool(result.get("all_subs_unverified")),
+
+        # ── 429 재시도 기록 (2026-08-31 신설) ────────────────────────────
+        # 지금까지 재시도는 로그에만 찍히고 결과 파일 어디에도 안 남았다.
+        # 그래서 9차에 "REQUEST_GAP 이 429 를 막은 것인지 재시도 상향이 흡수한
+        # 것인지" 를 결과 파일만으로는 판정할 수 없었다 — 서버·코랩 비교의
+        # 근거가 통째로 없었다는 뜻이다.
+        "retries": llm.retries_for(case["qid"]),
+        "retries_429": llm.retries_for(case["qid"], code=429),
+
         # --- 실행 경로·비용 ---
         "path": _trace_path(trace),
         "rounds": (result.get("round_no", 0) or 0) + 1,
@@ -360,6 +393,8 @@ COMPACT_KEYS = [
     # --- 근거 (검색 실패인지 인용 실패인지 갈리려면 둘 다 필요) ---
     "n_citations", "cite_dist", "retrieval_dist", "dangling_cites",
     "unsupported_values", "unsupported_values_pre", "unsupported_values_new",
+    # 값 대조가 원리상 못 잡는 서술형 오류 두 종 (2026-08-31)
+    "unknown_funds", "asset_claim_facts", "all_subs_unverified",
     "evidence_sufficient", "salvage",
     "citations", "retrieval",
 
@@ -377,6 +412,8 @@ COMPACT_KEYS = [
     "answer_len", "answer_truncated",
 
     "sub_questions", "path", "llm_calls", "tokens_total", "latency_sec",
+    # 429 재시도 (서버·코랩 비교의 근거. 지금까지 결과 파일에 없었다)
+    "retries", "retries_429",
     "error",
 ]
 
@@ -625,6 +662,25 @@ def main() -> int:
             "llm_budget": config.LLM_CALL_BUDGET,
             "llm_hard_cap": config.LLM_CALL_HARD_CAP,
             "use_confidence": config.USE_CONFIDENCE_WEIGHT,
+
+            # ── 재시도·동시성 3종 + 단계별 상한 (2026-08-31 신설) ─────────
+            #
+            # 9차에 `CLOVA_MAX_RETRY` 4→6, `BACKOFF_BASE` 3.0→5.0,
+            # `REQUEST_GAP` 0→0.5 를 **동시에** 바꿨는데, 어느 것이 429 를
+            # 막았는지 결과 파일만으로는 알 수 없었다 — 셋 다 기록이 없었다.
+            # 그중 `REQUEST_GAP` 은 배치 전용이라 서버에는 그 보호가 없다.
+            # 무엇으로 돌았는지가 안 남으면 서버·코랩 비교가 성립하지 않는다.
+            "llm_max_retry": config.LLM_MAX_RETRY,
+            "backoff_base": config.LLM_BACKOFF_BASE,
+            "backoff_max": config.LLM_BACKOFF_MAX,
+            "request_gap": config.REQUEST_GAP,          # ⚠️ 배치 전용
+            "llm_concurrency": config.LLM_MAX_CONCURRENCY,
+            "grade_workers": config.GRADE_WORKERS,
+            "grade_limit": config.env_int("PENSION_GRADE_LIMIT", 8),
+            "grade_wipeout_keep": config.GRADE_WIPEOUT_KEEP,
+            "combine_max_tokens": config.COMBINE_MAX_TOKENS,
+            "max_sibling_funds": config.MAX_SIBLING_FUNDS,
+
             "models": {"plan": config.MODEL_PLAN, "grade": config.MODEL_GRADE,
                        "answer": config.MODEL_ANSWER, "verify": config.MODEL_VERIFY,
                        "decompose": config.MODEL_DECOMPOSE,

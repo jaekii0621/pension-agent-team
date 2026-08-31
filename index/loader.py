@@ -232,6 +232,77 @@ def fund_names() -> List[str]:
     return sorted(seen)
 
 
+# ==========================================================================
+# 펀드 이름 다루기 — 핵심이름 / 변별자 / 형제 (2026-08-31 신설)
+#
+# ■ 왜 한 곳에 모으나
+#   같은 판단을 answer_generator(`_fund_core`)와 여기(`match_known_fund`)가
+#   **서로 다른 규칙으로** 하고 있었다. 앞쪽은 "증권|투자신탁|자투자|[(" 앞을
+#   자르고, 뒤쪽은 괄호 앞만 자른다. 규칙이 갈리면 "답변이 이 펀드를 말했나" 와
+#   "질문이 이 펀드를 지목했나" 의 판정이 어긋난다.
+#
+# ■ 이 코퍼스의 이름 구조
+#       한국투자골드플랜연금 증권전환형투자신탁1호 (국공채)
+#       └ 핵심이름 ────────┘ └ 상품형태 ───────┘ └ 변별자 ┘
+#   핵심이름만 보면 형제 세 펀드가 **하나로 뭉개진다.** 변별자는 상품형태 뒤에
+#   붙으므로 "증권 앞부분만 자르기" 로는 절대 잡히지 않는다.
+#   실측: 92개 카드 중 11개(5개 군)가 이렇게 뭉개진다.
+# ==========================================================================
+
+# 상품형태 꼬리 — 여기부터 뒤는 이름의 변별부가 아니다.
+_FUND_TAIL = re.compile(r"증권|투자신탁|자투자|[\[(]")
+
+# 변별자 — 이름 끝의 괄호/대괄호 안 내용. "(국공채)" · "[주식]" · "(채권)"
+_FUND_VARIANT = re.compile(r"[\[(]\s*([^\[\]()]{1,20})\s*[\])]\s*$")
+
+# 호수 — "제1호" · "1호" · "2호". 괄호가 없는 형제(1호/2호)를 가른다.
+_FUND_SERIES = re.compile(r"제?\s*(\d{1,2})\s*호")
+
+
+def fund_core(name: str) -> str:
+    """정식 명칭에서 **핵심이름**만 남긴다 (공백 제거).
+
+    '미래에셋장기성장포커스증권자투자신탁1호(주식)' -> '미래에셋장기성장포커스'
+
+    답변도 질문도 펀드를 축약해 부르므로("미래에셋장기성장포커스 사면"),
+    정식 명칭 전체로 대조하면 절대 안 맞는다. 그래서 핵심이름으로 본다.
+    ⚠️ 핵심이름은 형제펀드를 구분하지 **못한다.** 구분이 필요하면
+       `fund_variant()` 를 같이 봐라.
+    """
+    return re.sub(r"\s+", "", _FUND_TAIL.split(name or "", 1)[0])
+
+
+def fund_variant(name: str) -> str:
+    """형제펀드를 가르는 **변별자**. 없으면 빈 문자열.
+
+    '…투자신탁1호(국공채)' -> '국공채'   '…투자신탁 제1호[주식]' -> '주식'
+    괄호가 없으면 호수로 대신한다 — '…투자신탁2호' -> '2호'
+    """
+    m = _FUND_VARIANT.search((name or "").strip())
+    if m:
+        return re.sub(r"\s+", "", m.group(1))
+    s = _FUND_SERIES.search(name or "")
+    return f"{s.group(1)}호" if s else ""
+
+
+def _fund_groups() -> Dict[str, List[str]]:
+    """핵심이름 -> 그 이름을 공유하는 정식 명칭 목록."""
+    groups: Dict[str, List[str]] = {}
+    for n in fund_names():
+        groups.setdefault(fund_core(n), []).append(n)
+    return groups
+
+
+def sibling_funds(name: str) -> List[str]:
+    """같은 상품군의 형제 펀드 전부 (자기 자신 포함, 정렬).
+
+    형제가 없으면 `[name]` 하나만 돌려준다 — 호출부가 분기를 안 해도 된다.
+    """
+    if not name:
+        return []
+    return sorted(_fund_groups().get(fund_core(name), [name]))
+
+
 # 펀드명 지목으로 인정할 최소 접두어 길이.
 # 너무 짧으면 운용사명("미래에셋")만으로 걸려 변별력이 없고, 너무 길면 사용자가
 # 줄여 말한 경우를 놓친다. 8자면 "미래에셋장기성장" 수준이라 상품 특정이 된다.
@@ -263,22 +334,55 @@ def match_known_fund(question: str) -> str:
       사용자가 통째로 적는 일이 없다. 보통 앞부분만 말한다. 그래서 **이름의 앞부분이
       질문에 들어 있는지** 를 본다 — 긴 접두어부터 확인해 가장 구체적인 매칭을 고른다.
     """
+    hits = match_known_funds(question)
+    return hits[0] if hits else ""
+
+
+def match_known_funds(question: str) -> List[str]:
+    """지목된 펀드를 **전부** 돌려준다 — 형제펀드를 하나로 줄이지 않는다.
+
+    ■ 왜 목록인가 (2026-08-31, 9차 이슈 3)
+
+      `match_known_fund` 는 접두어가 가장 긴 것 **하나**만 돌려줬다. 그런데
+      형제펀드는 접두어가 정확히 같은 길이에서 동점이다.
+
+          한국투자골드플랜연금증권전환형투자신탁1호(국공채)
+          한국투자골드플랜연금증권전환형투자신탁1호(채권)
+          한국투자골드플랜연금증권전환형투자신탁1호(주식)
+                              ↑ 세 이름의 공통 접두어가 여기까지다
+
+      `if k > len(best)` 라 **먼저 만난 하나만** 남는다. 그 값이 그대로
+      `filters["fund_name"]` 이 되고, store 의 `_passes` 가
+      `any(n in fn or fn in n ...)` 로 대조하므로 **나머지 형제는 검색에서
+      통째로 배제된다.**
+
+      실측 P-B1: 질문이 "국공채·채권·주식, 뭐가 달라요?" 인데 채권 펀드 문서
+      (R2_KR5113420013)가 검색 후보에 아예 없었다. 답변은 채권 펀드의 수익률을
+      국공채 값(5.91%)으로 채웠다 — 실제 값은 5.74% 다.
+      **모델이 지어낸 게 아니라 자료를 못 받은 것이다.**
+
+    ■ 동점만 묶는다
+      접두어 길이가 같은 것만 형제로 본다. 더 긴 접두어로 특정된 펀드가 있으면
+      그것 하나만 남으므로, "이 펀드 총보수 얼마?" 류 단일 지목은 그대로다.
+    """
     try:
         q = (question or "").replace(" ", "")
         if not q:
-            return ""
-        best = ""
-        matched = ""
+            return []
+        best = 0
+        matched: List[str] = []
         for name in fund_names():
             head = re.split(r"[\[\(]", name)[0].replace(" ", "")
             for k in range(len(head), MIN_FUND_PREFIX - 1, -1):
                 if head[:k] in q:
-                    if k > len(best):
-                        best, matched = head[:k], name
+                    if k > best:
+                        best, matched = k, [name]
+                    elif k == best:
+                        matched.append(name)
                     break
-        return matched if best else ""
+        return sorted(matched)[:config.MAX_SIBLING_FUNDS]
     except Exception:                    # 인덱스 문제로 판단을 막지 않는다
-        return ""
+        return []
 
 
 def corpus_stats() -> dict:

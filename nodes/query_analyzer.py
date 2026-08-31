@@ -49,7 +49,8 @@ from typing import List
 from pydantic import BaseModel, Field
 
 import config
-from index import fund_names, match_known_fund, product_signal
+from index import (fund_core, fund_names, fund_variant, match_known_funds,
+                   product_signal, sibling_funds)
 from llm import llm
 from prompt import prompts
 from state import OverallState
@@ -87,12 +88,69 @@ def _sanitize(a: QueryAnalysis, known: List[str]) -> dict:
         if n in known_set:
             clean.append(n)
             continue
-        # 부분 표현("미래에셋퇴직플랜") → 정식 명칭으로 승격. 후보가 하나일 때만.
+        # 부분 표현("미래에셋퇴직플랜") → 정식 명칭으로 승격.
         cands = [k for k in known if n in k]
         if len(cands) == 1:
             clean.append(cands[0])
+        elif cands and len({fund_core(k) for k in cands}) == 1:
+            # 후보가 여럿이어도 **전부 같은 상품군의 형제**면 전부 살린다
+            # (2026-08-31, 9차 이슈 3).
+            #
+            # 예전에는 `len(cands) == 1` 이 아니면 통째로 버렸다. 그래서
+            # "한국투자골드플랜연금" 처럼 상품군을 부르는 말이 들어오면 후보 3건이
+            # 잡히고도 fund_name 이 빈 배열이 됐다. 형제끼리는 어느 것을 골라도
+            # 틀리므로 **고르지 말고 다 넣는 것**이 맞다 — 검색은 배제형 필터라
+            # 여럿을 넣어도 좁혀지기만 하지 넓어지지 않는다.
+            clean.extend(sorted(cands))
 
-    return {"질문유형": qt, "fund_name": clean[:3]}
+    # 중복 제거(순서 유지) 후 상한. 형제군이 최대 3개라 상한을 형제 상한에 맞춘다.
+    uniq = list(dict.fromkeys(clean))
+    return {"질문유형": qt, "fund_name": uniq[:config.MAX_SIBLING_FUNDS]}
+
+
+def _resolve_siblings(question: str, names: List[str]) -> List[str]:
+    """형제펀드(같은 상품군)를 질문에 맞춰 좁히거나 넓힌다 (2026-08-31, 9차 이슈 3).
+
+    ■ 두 방향이 모두 필요하다
+
+      좁히기 — 질문이 변별자를 적어 왔으면 그 하나만 남긴다.
+          "골드플랜연금 **주식형** 총보수?" → (주식) 하나.
+          `match_known_funds` 는 접두어 동점이라 형제 셋을 다 돌려주는데,
+          그대로 두면 답변 근거에 상관없는 형제 카드가 섞여 답이 흐려진다.
+
+      넓히기 — 변별자가 없으면 형제를 **전부** 넣는다.
+          "골드플랜연금은 어떤 상품인가요?" → 셋 다.
+          `store._passes` 의 fund_name 은 **배제형** 필터라, 형제를 빼 두면
+          그 문서가 검색 후보에서 통째로 사라진다. 어느 쪽인지 모르는 상태에서
+          하나를 골라 나머지를 배제하면, 모델은 남은 하나의 수치를 다른 형제
+          자리에 복사하는 수밖에 없다 — 실측 P-B1 이 정확히 그 경로였다.
+
+    ■ 상한
+      config.MAX_SIBLING_FUNDS 로 자른다. 형제군은 코퍼스 최대 3개라 여유가 있다.
+    """
+    if not names:
+        return []
+
+    q = (question or "").replace(" ", "")
+    out: List[str] = []
+    seen_core = set()
+    for n in names:
+        core = fund_core(n)
+        if core in seen_core:
+            continue
+        seen_core.add(core)
+        group = sibling_funds(n)
+        if len(group) > 1:
+            # 질문이 변별자를 명시했으면 그 형제만 남긴다.
+            pinned = [g for g in group if (v := fund_variant(g)) and v in q]
+            group = pinned or group
+        for g in group:
+            if g not in out:
+                out.append(g)
+
+    if len(out) != len(names):
+        log.info("형제펀드 정리: %d건 → %d건", len(names), len(out))
+    return out[:config.MAX_SIBLING_FUNDS]
 
 
 def analyze_query(state: OverallState) -> dict:
@@ -129,13 +187,20 @@ def analyze_query(state: OverallState) -> dict:
     # 안전검사 노드는 같은 판단을 **목록 대조**로 하고 있었고 세 문항 모두 잡았다.
     # 그 함수를 index 계층으로 올려 여기서도 쓴다. 문자열 비교라 오탐이 없고
     # LLM 호출도 0회다. LLM 이 잡으면 그대로 쓰고, 놓치면 이쪽이 받친다.
+    # ⚠️ 목록 대조도 **형제를 전부** 돌려받는다 (2026-08-31, 9차 이슈 3).
+    #    접두어가 동점인 형제 중 하나만 잡으면 나머지가 검색에서 배제된다
+    #    (store._passes 의 fund_name 은 배제형 필터다). 실측 P-B1 이 그 경로로
+    #    채권 펀드 문서를 통째로 못 봤다 — loader.match_known_funds 주석 참고.
     fund_from_list = False
     if not clean["fund_name"]:
-        hit = match_known_fund(question)
-        if hit:
-            clean["fund_name"] = [hit]
+        hits = match_known_funds(question)
+        if hits:
+            clean["fund_name"] = hits
             fund_from_list = True
-            log.info("LLM 이 놓친 펀드명을 목록 대조로 확보: %s", hit[:30])
+            log.info("LLM 이 놓친 펀드명을 목록 대조로 확보: %s",
+                     ", ".join(h[:30] for h in hits))
+
+    clean["fund_name"] = _resolve_siblings(question, clean["fund_name"])
 
     # 전역 필터는 기본값만 담는다. 서브질문마다 분해기가 덮어쓴다.
     #

@@ -24,6 +24,7 @@ import re
 from typing import Dict, List, Tuple
 
 import config
+from index import fund_core, fund_names, fund_variant
 from llm import llm
 from nodes.answer_generator import attach_citations_by_value
 from prompt import prompts
@@ -174,6 +175,170 @@ def _pre_unsupported(qa_pairs: List[dict]) -> List[str]:
                    for v in (p.get("unsupported_values") or [])})
 
 
+# ==========================================================================
+# 서술형 오류를 잡는 두 가지 대조 (2026-08-31 신설)
+#
+# `unsupported_values` 는 **문자열로 나타난 값**만 본다. 그래서 원리상 못 잡는
+# 유형이 둘 있고, 9차에서 둘 다 실제 피해로 나타났다.
+#
+#   ① 없는 상품을 만들어 냈다 (P-A2)
+#      "A채권형펀드", "B혼합형펀드" 에 수익률·보수율·위험등급을 붙이고 그중
+#      하나를 58세 사용자에게 **최종 추천**했다. 지표가 잡은 것은 거기 붙은
+#      숫자 4개뿐이고, 상품 자체가 허구라는 사실은 아무 데도 안 남았다.
+#
+#   ② 위험도를 서술로 뒤집었다 (P-A2)
+#      실명 펀드 5개 중 3개를 반대로 설명했다. 등급을 숫자로 안 쓰고 "위험 등급이
+#      낮고 주로 채권에 투자되는" 이라고 써서 값 대조에 하나도 안 걸렸다.
+#      **안정성 사례로 든 둘이 모두 2등급 주식형**이었다.
+#
+# 둘 다 LLM 호출 0회의 문자열 대조로 잡는다. 답변을 고치지는 않는다 —
+# 카드에 적힌 사실을 각주로 덧붙일 뿐이라 판정이 빗나가도 손해가 없다.
+# ==========================================================================
+
+# 자리표시자 상품명. 변별부가 **ASCII 한 글자나 기호 하나**인 경우만 본다.
+#   "A채권형펀드" · "B혼합형펀드" · "펀드 A" · "상품 B" · "○○펀드"
+# 한글 한 음절("그펀드","이펀드")은 대명사일 수 있어 일부러 제외한다.
+_PLACEHOLDER = [
+    re.compile(r"(?<![A-Za-z0-9가-힣])([A-Z]|[○◯□△▲])"
+               r"(?:채권형|주식형|혼합형|재간접|인덱스|성장형|안정형)?펀드"),
+    re.compile(r"(?:펀드|상품)\s*([A-Z])(?![A-Za-z0-9가-힣])"),
+]
+
+
+def _placeholder_funds(text: str) -> List[str]:
+    """코퍼스에 없는 **자리표시자 상품명**을 뽑는다 (없으면 빈 목록).
+
+    실제 상품명은 운용사명이 붙어 최소 두 음절 이상이다("트러스톤칭기스칸").
+    변별부가 한 글자면 모델이 자리를 채우려고 만든 이름이다.
+
+    ⚠️ 코퍼스 펀드명과 겹치면 잡지 않는다 — 만에 하나 한 글자짜리 실명이
+       들어와도 오탐이 안 나게 한다.
+    """
+    if not (config.FLAG_PLACEHOLDER_FUNDS and text):
+        return []
+    known = "".join(fund_names()).replace(" ", "")
+    found: List[str] = []
+    for pat in _PLACEHOLDER:
+        for m in pat.finditer(text):
+            name = m.group(0).strip()
+            key = name.replace(" ", "")
+            if key and key not in known and name not in found:
+                found.append(name)
+    return found[:5]
+
+
+# 자산유형 서술 — 카드 값과 답변 서술을 가르는 단어.
+_ASSET_WORDS = {
+    "주식": re.compile(r"주식형|주식\s*에|주식\s*위주|주식\s*비중|주식형\s*펀드|주식"),
+    "채권": re.compile(r"채권형|채권\s*에|채권\s*위주|채권\s*비중|채권형\s*펀드|채권"),
+}
+# 문장 경계. 마크다운 목록·표 행도 한 문장으로 본다.
+_SENT = re.compile(r"[\n|]+|(?<=[.!?])\s+")
+
+# 안정성 주장 — 이 코퍼스는 **1등급이 가장 높은 위험**이라 2등급 이하는 위험 상위권이다.
+_STABLE = re.compile(r"안정적|안정성|안전|저위험|위험\s*이?\s*낮|보수적\s*운용")
+# 부정·대비 문맥이면 잡지 않는다. "안정적이지 않습니다" / "높은 위험" 이 같이 나온 문장.
+_NEGATED = re.compile(r"않|아니|없|높은\s*위험|위험\s*이?\s*높|주의")
+# 위험 상위로 보는 등급 상한 (1=매우 높은 위험, 6=매우 낮은 위험)
+_RISKY_GRADE = 2
+
+
+def _asset_claim_conflicts(text: str, docs: List[dict]) -> List[str]:
+    """답변 서술이 카드와 어긋나는 곳을 찾아 **카드 사실**을 돌려준다.
+
+    두 가지를 본다. 둘 다 P-A2 에서 실제로 났고 값 대조로는 하나도 안 잡혔다.
+
+      ① 자산유형 역전 — 주식형을 "채권에 투자되는" 으로 (또는 그 반대로) 서술
+      ② 안정성 오주장 — 위험 상위 등급(1~2등급)을 "안정적" 예시로 제시
+
+    ■ 오탐을 줄이려고 조건을 좁게 잡는다
+      한 문장 안에서 ① 카드가 있는 펀드가 이름으로 불리고 ② 카드와 **반대되는**
+      단어만 나오고 ③ 맞는 단어·부정 표현은 안 나올 때만 잡는다.
+
+        "신한코리아롱숏은 주식형이라 채권형보다 위험합니다"
+            → 주식·채권이 같이 나오므로 안 걸린다 (정상 문장)
+        "위험 등급이 낮고 주로 채권에 투자되는 펀드로는 … 신한코리아롱숏 …"
+            → 채권만 나온다. 실제로 3등급 주식형이라 틀린 문장이다
+        "트러스톤칭기스칸은 2등급이라 안정적이지 않습니다"
+            → 부정 표현이 있으므로 안 걸린다
+
+    ■ 틀려도 손해가 없는 형태로 쓴다
+      답변 본문을 고치지 않고 카드에 적힌 사실을 각주로 덧붙일 뿐이다.
+      판정이 빗나가도 맞는 사실이 한 줄 늘어날 뿐이고, 맞았으면 위험도 역전을
+      바로잡는다. 문장 파싱이라 완벽할 수 없으므로 이 비대칭이 중요하다.
+
+    반환: "「펀드명」 자산유형 주식 / 위험등급 2등급" 형태의 사실 문자열 목록.
+    """
+    if not (config.CHECK_ASSET_CLAIM and text):
+        return []
+
+    cards: dict = {}
+    for ch in docs:
+        f = ch.get("fund") or {}
+        name = f.get("name")
+        if not name:
+            continue
+        asset = (f.get("asset_type") or "").strip()
+        try:
+            grade = int(f.get("risk_grade") or 0)
+        except (TypeError, ValueError):
+            grade = 0
+        if asset in _ASSET_WORDS or 0 < grade <= _RISKY_GRADE:
+            cards[name] = (f, asset, grade)
+    if not cards:
+        return []
+
+    # ⚠️ 핵심이름만으로 문장을 귀속시키면 **형제펀드에서 통째로 오탐이 난다**
+    #    (2026-08-31, 자체 점검에서 발견). "골드플랜연금(주식)은 2등급 주식형" 이라는
+    #    맞는 문장이 형제인 (국공채)·(채권) 카드에도 걸려, 자산유형이 어긋난다고
+    #    잡혔다. answer_generator._named_funds 와 같은 규칙을 여기도 적용한다 —
+    #    형제군에 속한 펀드는 **변별자까지** 문장에 있어야 그 펀드 이야기로 본다.
+    shared = {}
+    for name in cards:
+        shared[fund_core(name)] = shared.get(fund_core(name), 0) + 1
+
+
+    facts: List[str] = []
+    for raw in _SENT.split(text):
+        sent = re.sub(r"\s+", "", raw or "")
+        if not sent:
+            continue
+        negated = bool(_NEGATED.search(sent))
+        for name, (f, asset, grade) in cards.items():
+            core = fund_core(name)
+            if not core or core not in sent:
+                continue
+            if shared.get(core, 0) > 1:
+                var = fund_variant(name)
+                if not var or re.sub(r"\s+", "", var) not in sent:
+                    continue        # 형제 중 어느 것인지 문장이 특정하지 않았다
+
+            # ① 자산유형 역전 — 반대 단어만 있고 맞는 단어는 없을 때
+            bad_asset = False
+            if asset in _ASSET_WORDS:
+                other = "채권" if asset == "주식" else "주식"
+                bad_asset = bool(_ASSET_WORDS[other].search(sent)
+                                 and not _ASSET_WORDS[asset].search(sent))
+
+            # ② 안정성 오주장 — 위험 상위 등급을 안정적이라고 했을 때
+            bad_risk = bool(0 < grade <= _RISKY_GRADE
+                            and _STABLE.search(sent) and not negated)
+
+            if not (bad_asset or bad_risk):
+                continue
+
+            bits = [f"「{name}」"]
+            if asset:
+                bits.append(f"자산유형 {asset}")
+            if grade:
+                bits.append(f"위험등급 {grade}등급"
+                            + ("(위험 상위)" if grade <= _RISKY_GRADE else ""))
+            fact = " / ".join(bits)
+            if fact not in facts:
+                facts.append(fact)
+    return facts[:5]
+
+
 def combine_answer(state: OverallState) -> dict:
     """모든 결과를 하나의 최종 답변으로."""
     question = state["question"]
@@ -209,6 +374,27 @@ def combine_answer(state: OverallState) -> dict:
     verified_subs = [p for p in rebuilt
                      if p.get("verified") and (p.get("answer") or "").strip()]
     rescue = bool(config.KEEP_VERIFIED_WITHOUT_CITATION and verified_subs)
+
+    # ── 반대편 게이트: **전부** 검증 실패인 경우 (2026-08-31, 9차 이슈 1) ──
+    #
+    # 위 `rescue` 는 "인용 0건 + 검증 통과 → 살리고 고지" 다. 그 대칭인
+    # "인용 있음 + 전부 검증 실패" 는 지금까지 아무 데도 안 걸렸다.
+    # 인용이 1건이라도 있으면 근거 게이트를 통과하고, 아래 `blocks` 는
+    # `verified` 값과 무관하게 서브답변 전부를 합성 프롬프트에 넣는다.
+    #
+    #   실측 P-A2: 서브질문 1개, verified=false·score=0.6, 인용 1건.
+    #              코퍼스에 없는 가공 펀드를 만들어 최종 추천했다.
+    #   실측 P-B1: evidence_sufficient=False 인데 품질 0.8 로 통과했다 —
+    #              verifier 는 evidence_sufficient / evidence_ok 를 아예 안 본다.
+    #
+    # **빼는 것은 위험하다.** P-A2 는 서브질문이 하나뿐이라 빼면 `blocks` 가
+    # 비고 합성 LLM 에 줄 게 없어진다(빈 답변). 그래서 살리되
+    #   ① 합성 프롬프트에 "단정하지 말고 근거 있는 것만" 을 지시하고
+    #   ② 답변 끝에 검증 미통과 사실을 **코드로** 붙인다.
+    # ②가 반드시 필요하다 — 프롬프트 지시만으로 처리하면 안 지켜진다.
+    # 거절문구 건에서 프롬프트 지시가 6·7·8차 세 번 다 안 먹은 전례가 있다.
+    unverified_all = bool(
+        config.KEEP_UNVERIFIED_WITH_NOTE and rebuilt and not verified_subs)
 
     if (config.REFUSE_WHEN_NO_EVIDENCE and not global_cites
             and not calc and not strategy and not rescue):
@@ -277,10 +463,20 @@ def combine_answer(state: OverallState) -> dict:
             f"근거에 있는 사실은 그대로 전달한다.\n"
         )
 
+    # 서브답변이 전부 검증에 떨어졌으면 합성 단계에 그 사실을 알린다.
+    # (코드 쪽 고지는 아래 tail 에서 따로 붙인다 — 지시만으로는 안 지켜진다)
+    unverified_block = (
+        "\n\n[주의 — 검증 미통과]\n"
+        "아래 서브답변은 자동 검증(환각·품질)을 통과하지 못했다. 재구성할 때\n"
+        "  · 근거 번호가 붙은 문장만 사실로 다루고, 번호 없는 수치·상품명은 옮기지 마라.\n"
+        "  · 하나를 고르라는 식의 단정(\"이것을 선택하십시오\")으로 쓰지 마라.\n"
+        "  · 확인되지 않은 부분은 \"제공된 자료로는 확인되지 않습니다\" 로 남긴다.\n"
+    ) if unverified_all else ""
+
     with Timer() as t:
         body = llm.chat(
             prompts.combine_system,
-            f"[사용자 질문]\n{question}{caution_block}\n\n"
+            f"[사용자 질문]\n{question}{caution_block}{unverified_block}\n\n"
             f"[사용 가능한 근거 번호] {valid_ns}\n"
             f"위 번호만 쓸 수 있다. 새 번호를 만들지 마라.\n\n"
             + "\n\n".join(blocks),
@@ -320,8 +516,6 @@ def combine_answer(state: OverallState) -> dict:
     if refusal_cut:
         log.warning("거절 문구를 제거했습니다 (주의범주=%s)", caution or "-")
 
-    final = body + tail + _format_sources(global_cites)
-
     cite_note = f", 유효하지 않은 인용 {len(dangling)}건 제거{sorted(set(dangling))}" \
         if dangling else ""
     if dangling:
@@ -359,7 +553,33 @@ def combine_answer(state: OverallState) -> dict:
             if cid and cid not in seen:
                 seen.add(cid)
                 ordered.append(ch)
-    _, unsupported = attach_citations_by_value(body + tail, ordered, [])
+    # 서브질문까지 합쳐 넘긴다 — 클래스코드 판정 기준을 generate_answer 와 맞춘다.
+    _, unsupported = attach_citations_by_value(
+        body + tail, ordered, [],
+        question=" ".join([question] + [p.get("question") or "" for p in rebuilt]))
+
+    # ── 서술형 오류 고지 (2026-08-31, 9차 이슈 1·6-b) ────────────────────
+    #
+    # 값 대조가 원리상 못 잡는 두 유형을 여기서 잡아 **사실을 한 줄 덧붙인다.**
+    # 답변 본문은 건드리지 않는다 — 판정이 빗나가도 카드에 적힌 사실이 한 줄
+    # 늘어날 뿐이라 손해가 없고, 맞았으면 위험도 역전을 바로잡는다.
+    unknown_funds = _placeholder_funds(body)
+    if unknown_funds:
+        tail += "\n\n" + config.UNKNOWN_FUND_NOTE.format(
+            names=", ".join(unknown_funds))
+        log.warning("코퍼스에 없는 상품명이 최종 답변에 있습니다: %s", unknown_funds)
+
+    asset_facts = _asset_claim_conflicts(body, ordered)
+    if asset_facts:
+        tail += "\n\n" + config.ASSET_CLAIM_NOTE.format(
+            facts="; ".join(asset_facts))
+        log.warning("자산유형 서술이 카드와 어긋납니다: %s", asset_facts)
+
+    # 검증에 전부 떨어진 답변은 그 사실을 반드시 밝힌다 (프롬프트 지시와 이중).
+    if unverified_all and config.UNVERIFIED_NOTE not in body:
+        tail += f"\n\n{config.UNVERIFIED_NOTE}"
+
+    final = body + tail + _format_sources(global_cites)
 
     return {
         "final_answer": final,
@@ -367,6 +587,10 @@ def combine_answer(state: OverallState) -> dict:
         "dangling_cites": sorted(set(dangling)),
         "unsupported_values": unsupported,
         "unsupported_values_pre": _pre_unsupported(qa_pairs),
+        # 값 대조가 못 잡는 두 유형을 결과 파일에서 바로 셀 수 있게 남긴다.
+        "unknown_funds": unknown_funds,
+        "asset_claim_facts": asset_facts,
+        "all_subs_unverified": unverified_all,
         "llm_calls": used_llm,
         "trace": step("combine_answer",
                       summary=f"LLM 합성 — 서브답변 {len(rebuilt)}건 + 출처 "
@@ -374,7 +598,12 @@ def combine_answer(state: OverallState) -> dict:
                               + (f", 근거없는 값 {len(unsupported)}개"
                                  if unsupported else "")
                               + (", 거절문구 제거" if refusal_cut else "")
-                              + (", 인용 없이 살림" if rescue and not global_cites else ""),
+                              + (", 인용 없이 살림" if rescue and not global_cites else "")
+                              + (f", ⚠전원 검증실패 고지" if unverified_all else "")
+                              + (f", ⚠미확인 상품명 {len(unknown_funds)}건"
+                                 if unknown_funds else "")
+                              + (f", ⚠자산유형 서술 불일치 {len(asset_facts)}건"
+                                 if asset_facts else ""),
                       ms=ms),
     }
 

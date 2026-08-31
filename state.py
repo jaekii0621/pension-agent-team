@@ -210,6 +210,20 @@ class OverallState(TypedDict, total=False):
     unsupported_values: Annotated[Optional[List[str]], keep_last]
     unsupported_values_pre: Annotated[Optional[List[str]], keep_last]
 
+    # ── 값 대조가 원리상 못 잡는 두 유형 (2026-08-31, 9차 이슈 1·6-b) ──
+    #
+    #   unknown_funds       코퍼스에 없는 자리표시자 상품명 ("A채권형펀드")
+    #   asset_claim_facts   답변 서술과 어긋나는 카드 사실 (자산유형·위험등급)
+    #   all_subs_unverified 서브답변이 **전부** 검증에 떨어졌나
+    #
+    # ⚠️ 여기 선언이 없으면 combine_answer 가 계산해도 상태에 안 남는다.
+    #    실제로 `dangling_cites` 가 선언 없이 반환되고 있어서 run_queryset 이
+    #    읽는 값이 늘 빈 목록이었다 — 같이 선언한다.
+    unknown_funds: Annotated[Optional[List[str]], keep_last]
+    asset_claim_facts: Annotated[Optional[List[str]], keep_last]
+    all_subs_unverified: Annotated[Optional[bool], keep_last]
+    dangling_cites: Annotated[Optional[List[int]], keep_last]
+
     # --- 검증 ---
     verification: Annotated[Dict[str, Any], merge_dict]
     verify_retries: int

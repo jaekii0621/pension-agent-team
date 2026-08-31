@@ -101,6 +101,59 @@ def _embed(text: str) -> Optional[List[float]]:
         return None
 
 
+def _ensure_named_fund_cards(docs: List[dict], names: List[str]) -> tuple[List[dict], List[str]]:
+    """질문이 **지목한** 펀드의 카드가 근거에 없으면 채워 넣는다 (2026-08-31).
+
+    ■ 왜 필요한가 (9차 이슈 3)
+
+      검색은 점수 순으로 자리를 채우므로, 형제펀드 셋을 비교하는 질문에서
+      한 펀드의 카드가 자리 싸움에 밀려 빠질 수 있다. 그러면 답변은 그 펀드의
+      총보수·수익률·등급을 **받지 못한 채** 표를 채워야 한다.
+
+      실측 P-B1: 국공채·주식 카드만 들어오고 채권 카드가 빠졌다. 답변은 빈 칸을
+      두는 대신 국공채 값(0.544%/5.91%)을 채권 행에 그대로 복사했다.
+      카드가 있었으면 5.74% 라고 적을 수 있었다.
+
+    ■ 왜 안전한가
+      · 붙이는 대상이 **질문이 이름을 댄 펀드의 카드**뿐이다. 검색 상위 몇 건을
+        무조건 붙이던 옛 폴백(P-A1 오출처)과 성격이 다르다.
+      · 이미 들어온 카드는 건드리지 않는다. 없는 것만 채운다.
+      · 인용은 여전히 값 대조·모델 판단을 거친다 — 카드가 근거 목록에 있다고
+        자동으로 출처가 되지는 않는다.
+      · 상한이 config.MAX_SIBLING_FUNDS 라 근거 목록이 부풀지 않는다.
+
+    반환: (보강된 문서 목록, 새로 채운 펀드명)
+    """
+    if not (config.ENSURE_NAMED_FUND_CARDS and names):
+        return docs, []
+
+    have = {(d.get("fund") or {}).get("name")
+            for d in docs if d.get("chunk_type") == "fund_card"}
+    missing = [n for n in names if n and n not in have]
+    if not missing:
+        return docs, []
+
+    seen = {d.get("chunk_id") for d in docs}
+    added: List[str] = []
+    try:
+        chunks = get_index().chunks
+    except Exception as e:                      # 인덱스 문제로 검색을 막지 않는다
+        log_message(f"펀드카드 보강 건너뜀: {e}", "warning")
+        return docs, []
+
+    for c in chunks:
+        if len(added) >= config.MAX_SIBLING_FUNDS:
+            break
+        if c.get("chunk_type") != "fund_card" or c.get("chunk_id") in seen:
+            continue
+        fn = (c.get("fund") or {}).get("name")
+        if fn in missing and fn not in added:
+            docs.append(c)
+            seen.add(c.get("chunk_id"))
+            added.append(fn)
+    return docs, added
+
+
 def _merge_hits(*hit_lists: List[dict]) -> List[dict]:
     """여러 질의의 검색 결과를 chunk_id 기준으로 합친다 (같은 청크는 최고점 유지)."""
     best: Dict[str, dict] = {}
@@ -160,6 +213,12 @@ def retrieve_documents(state: RAGState) -> dict:
     applied = _relax(base_filters, used_level) if used_level >= 0 else {}
     docs = [h["chunk"] for h in hits]
 
+    # 질문이 이름을 댄 펀드의 카드는 자리 싸움에 밀려도 반드시 넣는다.
+    # (완화 단계와 무관하게 **원래 필터의** 펀드명을 기준으로 본다 — 완화는
+    #  후보를 넓히려고 조건을 푼 것이지, 질문이 그 펀드를 안 말한 게 아니다.)
+    docs, filled = _ensure_named_fund_cards(
+        docs, list(base_filters.get("fund_name") or []))
+
     relax_note = (
         "필터 없음(전체검색)" if used_level < 0
         else ("완화 없음" if used_level == 0
@@ -173,6 +232,8 @@ def retrieve_documents(state: RAGState) -> dict:
     from index.store import _affinity_of
     summary = (f"{len(docs)}건 (top_k={top_k}, 상품관여도={_affinity_of(applied):.2f}, "
                f"{relax_note}) 분포={dist}")
+    if filled:
+        summary += f" | 지목펀드 카드 보강 {len(filled)}건"
     if applied.get("사유"):
         summary += f" | 사유={applied['사유']}"
     if hyde_doc:

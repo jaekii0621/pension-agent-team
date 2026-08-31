@@ -85,6 +85,28 @@ def grade_documents(state: RAGState) -> dict:
     reasons = " | ".join(truncate(r["reason"], 60) for r in dropped[:3])
     used = sum(r["llm"] for r in results)
 
+    # ── 전멸 폴백 (2026-08-31 신설, 9차 이슈 5) ───────────────────────
+    #
+    # head 가 **전부** 기각되고 tail 도 비면 kept 가 빈 리스트가 된다. 그러면
+    # 답변 생성이 "근거 0건 → 미확인 응답" 으로 빠지고 근거 게이트에서 거절된다.
+    # 9차에 7건(78문항의 9%)이 이 경로였고 8차와 겹치는 건 1건뿐이다 —
+    # **매 실행마다 다른 문항이 걸린다.** 특정 질문의 문제가 아니라 채점기가
+    # 가끔 통째로 엄격해지는 문제다.
+    #
+    # 위 `_grade_one` 은 개별 채점이 실패하면 이미 통과시킨다 — "채점 실패는
+    # 문서를 버리는 근거가 못 된다". 전멸도 같은 성격이라 같은 철학을 적용한다.
+    #
+    # ⚠️ 삭제한 '상위 3건 폴백'과 다르다. 그건 답변과 무관한 청크를 **인용**으로
+    #    갖다 붙였고(P-A1 오출처), 이건 검색 결과를 답변 생성에 넘기는 것뿐이다.
+    #    인용은 여전히 값 대조·모델 판단을 거치고, 근거가 정말 무관하면 답변은
+    #    "확인되지 않습니다" 로 간다 — 거절과 결과가 같고 잃는 게 없다.
+    rescued = 0
+    if not kept and head and config.GRADE_WIPEOUT_KEEP > 0:
+        kept = head[:config.GRADE_WIPEOUT_KEEP]
+        rescued = len(kept)
+        log_message(f"문서 채점 전멸({len(head)}건 전부 탈락) → 검색 상위 "
+                    f"{rescued}건을 살립니다", "warning")
+
     return {
         "documents": kept,
         "irrelevance_reason": reasons,
@@ -92,7 +114,8 @@ def grade_documents(state: RAGState) -> dict:
         "llm_calls": used,
         "trace": step("grade_documents", qid=qid,
                       summary=f"{len(head)}건 채점 → {len(kept)}건 통과 "
-                              f"(탈락 {len(dropped)}건)",
+                              f"(탈락 {len(dropped)}건)"
+                              + (f" ⚠전멸 폴백 {rescued}건" if rescued else ""),
                       detail={"drop_reasons": reasons},
                       ms=t.ms),
     }

@@ -32,7 +32,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 import config
-from index import format_chunk_for_llm, to_citation
+from index import format_chunk_for_llm, fund_core, fund_variant, to_citation
 from llm import llm
 from prompt import prompts
 from state import RAGState
@@ -74,6 +74,60 @@ def _build_context(docs: List[dict]) -> tuple[str, List[dict]]:
     return "\n\n".join(lines), ordered
 
 
+def _sibling_notice(docs: List[dict]) -> str:
+    """근거에 **이름이 비슷한 형제 상품**이 섞여 있으면 그 사실을 못 박는다.
+
+    ■ 왜 프롬프트 상수가 아니라 여기서 만드나 (2026-08-31, 9차 이슈 3)
+
+      `answer_recommend_system` 에 이미 "근거가 같은 펀드의 것인지 확인한다" 는
+      일반 규칙이 있다. 그런데 P-B1 에서 안 지켜졌다 — 세 펀드의 이름이
+      "…투자신탁1호(국공채)" / "(채권)" / "(주식)" 로 **끝 두세 글자만** 다르다.
+      일반 규칙만으로는 "이름이 비슷한 경우" 가 지금 눈앞의 일이라는 것을 모델이
+      알아채지 못한다.
+
+      그래서 **지금 이 근거 묶음에 실제로 있는 형제만** 이름·등급·자산유형과 함께
+      나열한다. 형제가 없으면 빈 문자열이라 프롬프트가 그대로다 — 대부분의
+      문항에는 아무 영향이 없다(코퍼스 92개 중 형제는 11개, 5개 군뿐이다).
+
+    ■ 지시를 "섞지 마라" 가 아니라 "빈 칸은 비워 둬라" 로 적는 이유
+      P-B1 답변은 채권 펀드 행에 국공채 펀드의 보수·수익률을 그대로 옮겨 적고
+      "모든 펀드가 동일한 총보수와 수익률" 이라고 단정했다. 근거가 없을 때
+      **빈 칸을 만드는 것이 허용된다**는 것을 모르면 채우는 쪽으로 기운다.
+    """
+    groups: dict = {}
+    for ch in docs:
+        f = ch.get("fund") or {}
+        name = f.get("name")
+        if name:
+            groups.setdefault(fund_core(name), {})[name] = f
+
+    lines = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        for name, f in sorted(members.items()):
+            bits = [f"「{name}」"]
+            if f.get("risk_grade"):
+                bits.append(f"위험등급 {f['risk_grade']}")
+            if f.get("asset_type"):
+                bits.append(f"자산유형 {f['asset_type']}")
+            lines.append("  · " + " / ".join(bits))
+
+    if not lines:
+        return ""
+    return (
+        "\n\n[주의 — 이름이 비슷한 **서로 다른 상품**이 근거에 섞여 있다]\n"
+        + "\n".join(lines)
+        + "\n  이들은 이름 끝 괄호(또는 호수)만 다른 **별개 펀드**다. "
+          "보수·수익률·위험등급·자산유형이 서로 다를 수 있다.\n"
+          "  · 한 펀드의 수치를 다른 펀드 자리에 옮겨 적지 마라. 값이 같은지 "
+          "근거로 확인하지 않은 채 \"모두 동일하다\" 고 쓰지 마라.\n"
+          "  · 어떤 펀드의 값이 근거에 없으면 그 칸은 \"자료 없음\" 으로 둔다. "
+          "형제 펀드의 값으로 채우면 **틀린 답**이다.\n"
+          "  · 펀드를 부를 때 변별자(괄호 안 표기)를 반드시 함께 쓴다."
+    )
+
+
 # ==========================================================================
 # 값 대조 인용 부착 (2026-08-23 신설)
 #
@@ -109,12 +163,33 @@ _TOK_HIGH = [
     re.compile(r"\d{1,3}(?:,\d{3})+\s*원"),            # 264,000원
     re.compile(r"\d[\d,]*\s*만\s*원"),                 # 1,500만 원 · 900만원
     re.compile(r"\d[\d,]*\s*억\s*원"),                 # 1억원
-    # ⚠️ 앞뒤 경계를 **둘 다** 요구한다 (2026-08-26).
-    #    예전 패턴 `C-[A-Za-z]{1,3}\d?` 는 뒷경계가 없어서 "C-P2e" 를 "C-P2" 로
-    #    잘랐고, 실제 클래스가 C-P2 인 **다른 펀드**(신영마라톤)와 문자열이 우연히
-    #    겹쳐 그 펀드가 P-A4 답변의 출처로 붙었다.
-    #    코퍼스 실측 클래스코드: C-P · C-Pe · C-e · C-P2 · C-P2e · C-P1e · C-Pe2 ·
-    #    C-P2I … 글자와 숫자가 섞이므로 통째로 잡아야 잘림이 안 생긴다.
+]
+
+# 클래스코드는 **이름표지 값이 아니다** — 별도 계층으로 뺀다 (2026-08-31).
+#
+# ■ 무엇이 잘못됐었나 (9차 이슈 2, P-E5)
+#   예전엔 클래스코드가 HIGH 였고, 아래 부착 조건이 `if mh or len(ml) >= 2` 라
+#   **클래스코드 하나만 겹쳐도 인용이 붙었다.**
+#
+#   실측 P-E5: 인용 3건 전부 HIGH 교집합이 `{C-e}` 하나뿐이었다.
+#       R2_KR510902511M#p47#c010  HIGH={C-e}  LOW={5년}
+#       R2_KR510902511M#p46#c011  HIGH={C-e}  LOW={5년}
+#       R2_KR510902511M#p4#c011   HIGH={C-e}  LOW={}
+#   답변이 클래스 이름 "C-e" 를 언급했다는 것만으로 세 청크가 근거로 붙었다.
+#   답변이 그 청크의 표를 읽었다는 뜻이 전혀 아니다.
+#
+# ■ 왜 계층을 나누나 (아예 지우지 않고)
+#   클래스코드는 **변별자로는 쓸모가 있다.** 답변이 C-P2e 를 말하고 청크에도
+#   C-P2e 가 있으면, 같은 값을 가진 여러 후보 중 그 청크를 고를 근거가 된다.
+#   그래서 부착 **문턱에는 안 세고**, 정렬 우선순위에만 쓴다.
+#
+#   ⚠️ 앞뒤 경계를 **둘 다** 요구한다 (2026-08-26).
+#      예전 패턴 `C-[A-Za-z]{1,3}\d?` 는 뒷경계가 없어서 "C-P2e" 를 "C-P2" 로
+#      잘랐고, 실제 클래스가 C-P2 인 **다른 펀드**(신영마라톤)와 문자열이 우연히
+#      겹쳐 그 펀드가 P-A4 답변의 출처로 붙었다.
+#      코퍼스 실측 클래스코드: C-P · C-Pe · C-e · C-P2 · C-P2e · C-P1e · C-Pe2 ·
+#      C-P2I … 글자와 숫자가 섞이므로 통째로 잡아야 잘림이 안 생긴다.
+_TOK_CLASS = [
     re.compile(r"(?<![A-Za-z0-9])C-[A-Za-z0-9]{1,4}(?![A-Za-z0-9])"),  # C-P · C-P2e
     re.compile(r"(?<![A-Za-z0-9])CRP\d?(?![A-Za-z0-9])"),             # CRP
 ]
@@ -126,6 +201,35 @@ _TOK_HIGH = [
 # (7차 P-A1 의 '2등급'·'5등급' 이 이 경우로 보인다).
 # 부분문자열 대조 때는 우연히 걸렸고, 토큰 교집합으로 바꾸면서 드러났다.
 _TOK_GRADE = re.compile(r"(?:위험)?등급\s*([1-6])|([1-6])\s*등급")
+
+# ── 단위를 머리에 선언한 표 (2026-08-31 신설) ─────────────────────────
+#
+# ■ 무엇이 안 보였나
+#   `_TOK_HIGH` 의 백분율 패턴은 **`%` 기호를 반드시 요구한다.** 그런데
+#   투자설명서 실적표는 기호를 셀마다 붙이지 않고 표 머리에 한 번 선언한다.
+#
+#       나. 연도별 수익률 추이(단위:%)
+#       종류A-e   -23.33   36.13   -30.82   19.20   33.59
+#
+#   그래서 청크 쪽에서 값이 **하나도 추출되지 않았다.** 답변은 "-23.33%" 로
+#   쓰므로 답변 쪽에서만 토큰이 나오고, 교집합이 비어 근거 있는 값이 전부
+#   '근거 없는 값' 으로 잡힌다.
+#
+#   실측: 투자설명서 청크 7,904건 중 412건(5.2%)이 단위를 선언하는데,
+#   그 안의 값은 `%` 표기 423개 대 맨숫자 8,322개다. 지금 규칙은 5%만 읽는다.
+#   섹션 분포도 재무·운용실적 241 · 요약정보 140 으로 **성과 수치가 사는 자리**에
+#   정확히 몰려 있다.
+#
+#   9차 `unsupported_values` 35개 중 16개(46%)가 이 경로의 오탐이었다
+#   (P-E5 15 · P-E1 1). P-E5 는 "환각 15개" 로 기록됐지만 실제로는 답변이
+#   인용한 p47 표에 **그대로 있는 값**이었다.
+#
+# ■ 왜 좁게 거나
+#   맨숫자를 아무 데서나 값으로 읽으면 조항 번호·페이지·날짜까지 걸린다.
+#   **표가 스스로 "이 숫자들은 %다" 라고 밝힌 경우에만** 연다.
+_UNIT_PCT = re.compile(r"단위\s*[:：]?\s*\(?\s*%")
+# 앞뒤로 숫자·소수점·% 가 붙지 않은 소수. 부호는 버린다(`%` 경로와 동일).
+_BARE_DEC = re.compile(r"(?<![\d.,%])-?(\d{1,3}\.\d{1,2})(?![\d.]|\s*%)")
 _TOK_LOW = [
     re.compile(r"\d+\s*개월"),                         # 3개월
     re.compile(r"\d+\s*년"),                           # 20년
@@ -133,6 +237,43 @@ _TOK_LOW = [
 ]
 
 _AUTO_MAX = 3          # 자동 부착 상한 — 목록이 길어지면 오히려 근거가 흐려진다
+
+# 질문이 **클래스 자체를 묻고 있는가**. 클래스코드를 근거로 셀지 가르는 신호다.
+#   "C-P 총보수가 얼마죠?"                     → 코드가 질문에 있다
+#   "연금저축으로 사려면 어느 클래스로 사야 해요?" → 코드는 없지만 클래스 질문이다
+_CLASS_TOPIC = re.compile(r"클래스|종류형|클라스")
+
+
+def _class_is_topic(question: str) -> bool:
+    """클래스코드를 '값'으로 셀 수 있는 질문인가 (2026-08-31).
+
+    ■ 왜 질문을 보나 — 9차 실측으로 규칙을 정했다
+
+      "클래스코드만 겹치면 인용을 붙이지 않는다" 를 **무조건** 적용해 보니
+      9차 값대조 인용 74건 중 26건(35%)이 날아갔다. 그런데 그중 14건이
+      P-C 트랙 — **클래스가 질문의 주제인 문항들**이었다.
+
+          P-C1  "미래에셋장기성장포커스 C-P 총보수가 얼마죠?"
+          P-C6  "C-F 클래스는 기관 전용이라던데, 개인은 못 사나요?"
+          P-C3  "…연금저축으로 사려면 어느 클래스로 사야 해요?"
+
+      이 문항들에서 C-P 가 적힌 청크는 **정당한 근거다.** 사용자가 그 클래스를
+      물었고 그 청크가 그 클래스를 설명한다. 여기서 인용을 떼면 근거표시 점수를
+      P-C 트랙 전체에서 잃는다 — 고치려던 것보다 손해가 크다.
+
+      반대로 P-E5 는 "최근 5년 수익률 추이" 를 물었다. 답변이 클래스 이름
+      `C-e` 를 언급했다는 것만으로 수익률 표 청크가 근거로 붙었다. 질문은
+      클래스와 무관하다.
+
+    ■ 그래서 기준은 "코드가 답변에 나왔나" 가 아니라 "질문이 클래스를 묻나" 다
+      코드가 질문에 직접 있거나(P-C1·C2·C5·C6), 질문이 클래스를 주제로
+      부르면(P-C3) 근거로 센다. 둘 다 아니면 이름표로 본다.
+    """
+    if not question:
+        return False
+    if _CLASS_TOPIC.search(question):
+        return True
+    return any(p.search(question) for p in _TOK_CLASS)
 
 
 def _fund_of(ch: dict) -> str:
@@ -155,11 +296,12 @@ def _fund_of(ch: dict) -> str:
 def _fund_core(name: str) -> str:
     """'미래에셋장기성장포커스증권자투자신탁1호(주식)' -> '미래에셋장기성장포커스'
 
-    답변은 펀드를 축약해 부른다("미래에셋장기성장포커스 사면"). 정식 명칭 전체를
-    대조하면 절대 안 맞으므로, 상품 종류를 나타내는 꼬리를 떼고 핵심 이름만 본다.
+    ⚠️ 이 값은 **형제펀드를 구분하지 못한다.** 구현은 index.loader 에 있다
+       (질문 쪽 `match_known_funds` 와 같은 규칙을 써야 하기 때문 — 규칙이
+       갈리면 "질문이 지목한 펀드" 와 "답변이 말한 펀드" 의 판정이 어긋난다).
+       구분이 필요한 자리에서는 아래 `_named_funds()` 를 써라.
     """
-    core = re.split(r"증권|투자신탁|자투자|[\[(]", name or "", 1)[0]
-    return _norm(core)
+    return fund_core(name)
 
 
 def _norm(v: str) -> str:
@@ -167,25 +309,109 @@ def _norm(v: str) -> str:
     return re.sub(r"\s+", "", v)
 
 
+# 소수 표기 정규화용 — "0.310%" 의 앞자리/소수부/꼬리를 가른다.
+_DEC = re.compile(r"^(\d[\d,]*)\.(\d+)(.*)$")
+
+
+def _canon(v: str) -> str:
+    """값 토큰을 **한 표기로** 맞춘다 (2026-08-31, 9차 이슈 6-a).
+
+        0.310%  ->  0.31%      2.00%  ->  2%      1,500만 원 -> 1,500만원
+
+    ■ 왜 필요한가
+      P-E1 이 `unsupported_values: ["0.310%"]` 로 플래그됐는데 카드 실제값은
+      `0.31%` 였다. **값은 맞고 자릿수 표기만 달랐다.** 문자열 교집합이라
+      소수점 뒤 0 하나에 근거 있는 값이 환각으로 잡힌다.
+
+      반대 방향으로도 샌다 — 같은 값을 다른 표기로 쓴 청크가 근거로 안 붙는다.
+
+    ■ 왜 값에만 거나
+      답변 본문 전체에 걸면 펀드명·문장까지 건드리게 된다. 대조하는 것은
+      토큰이므로 토큰만 맞추면 충분하다.
+    """
+    v = re.sub(r"\s+", "", v)
+    m = _DEC.match(v)
+    if m:
+        frac = m.group(2).rstrip("0")
+        v = m.group(1) + (f".{frac}" if frac else "") + m.group(3)
+    return v
+
+
 def _tokens(text: str):
-    """(높은 특이도 집합, 낮은 특이도 집합)"""
-    hi = {_norm(m.group(0)) for p in _TOK_HIGH for m in p.finditer(text or "")}
+    """(높은 특이도, 낮은 특이도, 클래스코드) 세 집합.
+
+    클래스코드를 따로 돌려주는 이유는 위 `_TOK_CLASS` 주석 참고 —
+    **이름표라 부착 문턱에 세면 안 된다.**
+    """
+    text = text or ""
+    hi = {_canon(m.group(0)) for p in _TOK_HIGH for m in p.finditer(text)}
     # 등급은 어느 표기로 쓰였든 "N등급" 하나로 모은다.
     hi |= {(m.group(1) or m.group(2)) + "등급"
-           for m in _TOK_GRADE.finditer(text or "")}
-    lo = {_norm(m.group(0)) for p in _TOK_LOW for m in p.finditer(text or "")}
-    return hi, lo - hi
+           for m in _TOK_GRADE.finditer(text)}
+    # 표가 "단위:%" 로 선언했으면 맨숫자도 백분율로 읽는다 — 위 주석 참고.
+    if _UNIT_PCT.search(text):
+        hi |= {_canon(m.group(1) + "%") for m in _BARE_DEC.finditer(text)}
+    lo = {_canon(m.group(0)) for p in _TOK_LOW for m in p.finditer(text)}
+    cls = {_norm(m.group(0)) for p in _TOK_CLASS for m in p.finditer(text)}
+    return hi, lo - hi, cls - hi - lo
+
+
+def _named_funds(ordered: List[dict], ans_n: str) -> set:
+    """답변이 **실제로 말한** 펀드 정식명칭 집합 (2026-08-31, 9차 이슈 3).
+
+    ■ 예전 판정이 형제펀드에서 무력했다
+          named = {fund for fund in ... if _fund_core(fund) in ans_n}
+
+      핵심이름만 보므로 "한국투자골드플랜연금(국공채/채권/주식)" 세 펀드가 전부
+      같은 조건을 만족한다. "답변이 특정 펀드를 말했으면 그 펀드만 인용" 이라는
+      정밀도 가드가 이 상품군에서는 **아예 작동하지 않았다.**
+      코퍼스 실측: 92개 중 11개(5개 군)가 이 구조이고, 그중 4개 군은 등급이나
+      자산유형이 서로 다르다 — 뭉개지면 위험도가 반대로 나간다.
+
+    ■ 형제군에서만 조건을 하나 더 건다
+      후보 중 핵심이름이 겹치는 것이 **둘 이상일 때만**, 변별자(괄호 안 국공채·
+      채권·주식, 또는 호수)까지 답변에 있어야 그 펀드를 말한 것으로 본다.
+      형제가 없는 86개 펀드는 판정이 예전과 완전히 같다 — 회귀가 없다.
+
+    ■ 아무도 특정 못 하면 빈 집합
+      답변이 상품군만 부르고 변별자를 안 썼으면 어느 형제인지 확정할 수 없다.
+      그때는 빈 집합을 돌려주고, 호출부는 "펀드 특정 없음" 경로로 간다
+      (= 예전과 같은 보수적 동작. 특정 못 한 것을 특정했다고 우기지 않는다).
+    """
+    groups: dict = {}
+    for ch in ordered:
+        f = _fund_of(ch)
+        if f:
+            groups.setdefault(_fund_core(f), set()).add(f)
+
+    named = set()
+    for core, members in groups.items():
+        if not core or core not in ans_n:
+            continue
+        if len(members) == 1:
+            named |= members
+            continue
+        named |= {m for m in members
+                  if (v := fund_variant(m)) and _norm(v) in ans_n}
+    return named
 
 
 def attach_citations_by_value(answer: str, ordered: List[dict],
-                              cites: List[dict]):
+                              cites: List[dict], question: str = ""):
     """답변의 값이 실제로 들어 있는 청크를 인용으로 붙인다.
+
+    `question` — 클래스코드를 근거로 셀지 가르는 데만 쓴다(`_class_is_topic`).
+    안 주면 세지 않는다(보수적 기본값).
 
     반환: (보강된 인용 목록, 어느 청크에도 없는 값 목록)
     """
-    hi, lo = _tokens(answer)
-    if not (hi or lo):
+    hi, lo, cls = _tokens(answer)
+    if not (hi or lo or cls):
         return cites, []
+
+    # 질문이 클래스를 묻고 있으면 클래스코드도 특이값으로 센다 — 주석 참고.
+    if _class_is_topic(question):
+        hi, cls = hi | cls, set()
 
     already = {c.get("chunk_id") for c in cites}
     nxt = max([c.get("n") or 0 for c in cites] or [0]) + 1
@@ -195,11 +421,11 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
     # "0.28%" 같은 보수율은 여러 펀드에 존재한다. 값만 보면 답변과 무관한 펀드가
     # 근거로 붙을 수 있다. 답변에 펀드명이 나와 있으면 그 펀드 청크를 우선한다.
     # (상품 트랙에 인용 0건이 몰려 있어서 — 31건 중 23건 — 여기가 정밀도의 관건이다)
+    # ⚠️ 형제펀드는 핵심이름이 같아 변별자까지 봐야 한다 — `_named_funds` 주석 참고.
     ans_n = _norm(answer or "")
-    named = {_fund_of(ch) for ch in ordered
-             if _fund_of(ch) and _fund_core(_fund_of(ch)) in ans_n}
+    named = _named_funds(ordered, ans_n)
 
-    hits = []            # (펀드명 일치, HIGH 수, LOW 수, 청크, 일치값)
+    hits = []            # (펀드명 일치, HIGH 수, 클래스 수, LOW 수, 청크, 일치값)
     covered = set()
     for ch in ordered:
         # ⚠️ 부분문자열이 아니라 **양쪽에서 뽑은 토큰끼리** 맞춘다 (2026-08-26).
@@ -207,25 +433,31 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
         #    "C-P2" 가 "C-P2e" 안에서 걸린다 — 둘 다 다른 펀드를 출처로 붙이는
         #    경로다. 같은 정규식으로 청크에서도 값을 뽑아 집합으로 맞추면
         #    경계가 자동으로 지켜진다.
-        bhi, blo = _tokens(ch.get("text") or "")
-        body_vals = bhi | blo
+        bhi, blo, bcls = _tokens(ch.get("text") or "")
+        body_vals = bhi | blo | bcls
         mh = hi & body_vals
         ml = lo & body_vals
-        covered |= mh | ml
+        mc = cls & body_vals
+        # ⚠️ `covered` 에는 클래스코드도 넣는다. 이건 "답변이 말한 값이 근거
+        #    어딘가에 있는가" 라는 별개 질문이고, 클래스코드가 근거에 실재하는데
+        #    '근거 없는 값' 으로 잡히면 그게 오탐이다. 부착 문턱만 달라진다.
+        covered |= mh | ml | mc
         if ch.get("chunk_id") in already:
             continue
         fund_ok = bool(named) and _fund_of(ch) in named
-        # HIGH 한 개면 충분, LOW 만이면 두 개 이상이어야 붙인다
+        # HIGH 한 개면 충분, LOW 만이면 두 개 이상이어야 붙인다.
+        # 클래스코드는 문턱에 세지 않는다 — 이름표가 겹친 것은 근거가 아니다.
         if mh or len(ml) >= 2:
-            hits.append((1 if fund_ok else 0, len(mh), len(ml), ch,
-                         sorted(mh | ml)))
+            hits.append((1 if fund_ok else 0, len(mh), len(mc), len(ml), ch,
+                         sorted(mh | ml | mc)))
 
     # 답변이 펀드를 특정했는데 그 펀드 청크가 하나라도 걸렸다면, 다른 펀드는 버린다
     if any(h[0] for h in hits):
         hits = [h for h in hits if h[0]]
 
-    hits.sort(key=lambda x: (-x[0], -x[1], -x[2]))
-    for _, _, _, ch, matched in hits[:_AUTO_MAX]:
+    # 클래스코드는 **동점을 가르는 데만** 쓴다 (HIGH 다음, LOW 앞).
+    hits.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3]))
+    for _, _, _, _, ch, matched in hits[:_AUTO_MAX]:
         c = to_citation(ch)
         c["n"] = nxt
         c["auto"] = True                       # 코드가 붙인 것임을 표시
@@ -234,11 +466,12 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
         nxt += 1
 
     # 어느 청크에도 없는 값 = 근거 없이 말한 수치
-    unsupported = sorted((hi | lo) - covered)
+    unsupported = sorted((hi | lo | cls) - covered)
     return cites, unsupported
 
 
-def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set) -> bool:
+def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set,
+                      named: set) -> bool:
     """본문 `[n]` 으로 복원하려는 청크가 답변과 실제로 맞물리는지 대조한다.
 
     ■ 왜 필요한가 (2026-08-26)
@@ -257,10 +490,11 @@ def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set) -> bool:
     fund = _fund_of(ch)
     if not fund:
         return True                     # 규정문서는 그대로 통과
-    if _fund_core(fund) in _norm(answer or ""):
+    if fund in named:
         return True                     # 답변이 이 펀드를 직접 언급했다
-    bhi, blo = _tokens(ch.get("text") or "")
-    body_vals = bhi | blo
+                                        # (형제펀드면 변별자까지 맞아야 한다)
+    bhi, blo, _bcls = _tokens(ch.get("text") or "")
+    body_vals = bhi | blo               # 클래스코드는 근거로 안 센다
     if hi & body_vals:
         return True                     # 답변의 특이값이 이 카드에 실제로 있다
     return len(lo & body_vals) >= 2
@@ -303,9 +537,12 @@ def generate_answer(state: RAGState) -> dict:
         f"\n\n[주의 신호] {prompts.caution_guidance(caution)}"
     ) if caution else ""
 
+    # 근거에 형제펀드가 섞여 있으면 그 사실을 명시한다 (없으면 빈 문자열).
+    sibling_block = _sibling_notice(ordered)
+
     user = (
         f"[사용자 원 질문]\n{original}\n\n"
-        f"[지금 답해야 할 질문]\n{question}{caution_block}\n\n"
+        f"[지금 답해야 할 질문]\n{question}{caution_block}{sibling_block}\n\n"
         f"[근거]\n{context}"
     )
 
@@ -365,13 +602,18 @@ def generate_answer(state: RAGState) -> dict:
     #        붙는다(P-A4: 답변 표에 없는 펀드가 출처로). 그래서 복원 대상이
     #        펀드카드인 경우 답변이 그 펀드를 실제로 말했는지 대조한다.
     if not cites and res.main_answer:
-        hi, lo = _tokens(res.main_answer)
+        hi, lo, _cls = _tokens(res.main_answer)
+        # 클래스코드 취급을 값 대조 경로와 똑같이 맞춘다 — 질문이 클래스를
+        # 묻는 문항에서만 근거로 센다(`_class_is_topic`).
+        if _class_is_topic(f"{original} {question}"):
+            hi |= _cls
+        named = _named_funds(ordered, _norm(res.main_answer))
         dropped = 0
         for n in sorted({int(x) for x in CITE_IN_TEXT.findall(res.main_answer)}):
             i = n - 1
             if not (0 <= i < len(ordered)):
                 continue
-            if not _restored_cite_ok(ordered[i], res.main_answer, hi, lo):
+            if not _restored_cite_ok(ordered[i], res.main_answer, hi, lo, named):
                 dropped += 1
                 continue
             c = to_citation(ordered[i])
@@ -403,7 +645,11 @@ def generate_answer(state: RAGState) -> dict:
     # 진짜 문제(모델이 인용 표기를 빠뜨림)는 폴백으로 덮을 게 아니라
     # 프롬프트(EVIDENCE_CONVENTIONS)와 합성 후 검증(combiner)에서 다룬다.
     # ── 값 대조로 인용을 보강한다 (LLM 호출 0회) ─────────────────────
-    cites, unsupported = attach_citations_by_value(res.main_answer, ordered, cites)
+    # 질문은 클래스코드를 근거로 셀지 가르는 데만 쓴다(`_class_is_topic`).
+    # 원 질문과 서브질문을 **둘 다** 본다 — 분해기가 "어느 클래스" 를 서브질문에서
+    # 처음 꺼내는 경우가 있고, 원 질문에만 코드가 적힌 경우도 있다.
+    cites, unsupported = attach_citations_by_value(
+        res.main_answer, ordered, cites, question=f"{original} {question}")
     if unsupported:
         log.info("근거에서 못 찾은 값 %d개: %s", len(unsupported), unsupported[:5])
 
@@ -425,6 +671,7 @@ def generate_answer(state: RAGState) -> dict:
         "trace": step("generate_answer", qid=qid,
                       summary=f"[{mode}] {len(res.main_answer)}자, 인용 {len(cites)}건"
                           + (" ⚠구제경로(파싱실패)" if salvaged else "")
+                          + (", 형제펀드 주의 부착" if sibling_block else "")
                               + (f"(자동 {sum(1 for c in cites if c.get('auto'))})"
                                  if any(c.get("auto") for c in cites) else "")
                               + (f"(본문복원 {sum(1 for c in cites if c.get('restored'))})"

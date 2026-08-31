@@ -10,11 +10,15 @@ from . import artifact                                   # noqa: F401
 from .loader import (                                    # noqa: F401
     corpus_stats,
     format_chunk_for_llm,
+    fund_core,
     fund_names,
+    fund_variant,
     is_table_chunk,
     load_corpus,
     match_known_fund,
+    match_known_funds,
     searchable_text,
+    sibling_funds,
     to_citation,
 )
 from .store import (                                     # noqa: F401
@@ -27,7 +31,9 @@ from .store import (                                     # noqa: F401
 
 __all__ = [
     "load_corpus", "corpus_stats", "format_chunk_for_llm", "to_citation",
-    "fund_names", "match_known_fund", "searchable_text", "is_table_chunk",
+    "fund_names", "match_known_fund", "match_known_funds",
+    "fund_core", "fund_variant", "sibling_funds",
+    "searchable_text", "is_table_chunk",
     "PensionIndex", "get_index", "reset_index",
     "bm25_top1", "product_signal",
     "artifact",

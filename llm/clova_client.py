@@ -106,6 +106,13 @@ class ClovaLLM:
         #   배열이 통째로 비기 때문이다. 로그로만 남기면 결과 분석에서
         #   원인을 못 좁히므로 기록으로 남긴다.
         self.salvages: List[dict] = []
+        # HTTP 재시도 기록 (2026-08-31 신설)
+        #   429 가 몇 번 났고 얼마나 기다렸는지가 **어디에도 집계되지 않았다.**
+        #   CallLog 에는 stage·model·토큰·ms·ok·note·qkey 뿐이고 결과 파일
+        #   meta.params 에도 재시도 설정이 안 남았다. 그래서 9차에 세 값을 동시에
+        #   바꾼 뒤 "무엇이 429 를 막았나" 를 결과만 보고는 판정할 수 없었다.
+        #   list.append 는 GIL 아래서 원자적이라 fan-out 병렬에서도 안전하다.
+        self.retries: List[dict] = []
         self.enabled = bool(self.key)
         self._qkey = ""                       # 현재 처리 중인 질문 라벨
         if not self.enabled:
@@ -196,6 +203,9 @@ class ClovaLLM:
                                     "(%d/%d)", wait, attempt + 1, retries)
                     else:
                         wait = 1.5 * (attempt + 1)
+                    self.retries.append({"qkey": self._qkey, "code": e.code,
+                                         "attempt": attempt + 1,
+                                         "wait": round(wait, 1)})
                     time.sleep(wait)
                     last = e
                     continue
@@ -390,6 +400,19 @@ class ClovaLLM:
             "stage": stage or "-",
         })
 
+    def retries_for(self, qkey: Optional[str] = None,
+                    code: Optional[int] = None) -> int:
+        """질문 1건이 겪은 HTTP 재시도 횟수. `code=429` 로 레이트리밋만 셀 수 있다."""
+        return sum(1 for r in self.retries
+                   if (qkey is None or r["qkey"] == qkey)
+                   and (code is None or r["code"] == code))
+
+    def retry_events(self, qkey: Optional[str] = None) -> List[dict]:
+        """재시도 원본 기록. qkey 를 안 주면 전체."""
+        if qkey is None:
+            return list(self.retries)
+        return [r for r in self.retries if r["qkey"] == qkey]
+
     def salvage_events(self, qkey: Optional[str] = None) -> List[dict]:
         """질문 하나가 겪은 구제 경로 목록. qkey 를 안 주면 전체."""
         if qkey is None:
@@ -484,6 +507,7 @@ class ClovaLLM:
     def reset_usage(self) -> None:
         self.calls.clear()
         self.salvages.clear()
+        self.retries.clear()
         self._qkey = ""
 
 
