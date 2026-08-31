@@ -388,6 +388,13 @@ def _named_funds(ordered: List[dict], ans_n: str) -> set:
     for core, members in groups.items():
         if not core or core not in ans_n:
             continue
+        # ⚠️ 핵심이름이 **다른 펀드 이름의 접두어**인 경우를 막는다 (2026-08-31).
+        #    코퍼스 실측 3쌍 — '미래에셋퇴직플랜' ⊂ '미래에셋퇴직플랜단기' 등.
+        #    짧은 이름의 등장이 전부 긴 이름 안이면 답변은 그 펀드를 말한 적이 없다.
+        #    (둘 다 언급했으면 짧은 쪽 등장 횟수가 더 많으므로 그대로 통과한다)
+        longer = [o for o in groups if o != core and core in o and o in ans_n]
+        if longer and ans_n.count(core) <= sum(ans_n.count(o) for o in longer):
+            continue
         if len(members) == 1:
             named |= members
             continue

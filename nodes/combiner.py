@@ -297,6 +297,19 @@ def _asset_claim_conflicts(text: str, docs: List[dict]) -> List[str]:
     for name in cards:
         shared[fund_core(name)] = shared.get(fund_core(name), 0) + 1
 
+    # ⚠️ 핵심이름이 **다른 펀드 이름의 접두어**인 경우도 막는다
+    #    (2026-08-31, 10차 실행에서 오탐으로 발현).
+    #
+    #    코퍼스 실측 3쌍:
+    #        '미래에셋퇴직플랜'   ⊂ '미래에셋퇴직플랜KRX100인덱스'
+    #        '미래에셋퇴직플랜'   ⊂ '미래에셋퇴직플랜단기'
+    #        'KCGI코리아'        ⊂ 'KCGI코리아목표전환형'
+    #
+    #    P-H3 답변의 표에 「미래에셋퇴직플랜단기…[채권]」 행이 있었는데, 짧은 쪽
+    #    펀드(…1호(주식))의 핵심이름이 그 행 안에 들어 있어 "주식형을 채권으로
+    #    서술했다" 는 오탐이 났다. 형제(괄호 변별자)와는 다른 형태의 이름 충돌이다.
+    #    같은 구간에 **더 긴 핵심이름**이 함께 있으면 그쪽 펀드 이야기로 본다.
+    all_cores = set(shared)
 
     facts: List[str] = []
     for raw in _SENT.split(text):
@@ -307,6 +320,9 @@ def _asset_claim_conflicts(text: str, docs: List[dict]) -> List[str]:
         for name, (f, asset, grade) in cards.items():
             core = fund_core(name)
             if not core or core not in sent:
+                continue
+            # 같은 구간에 더 긴 핵심이름이 있으면 그쪽 펀드 이야기다 (위 주석 참고)
+            if any(o != core and core in o and o in sent for o in all_cores):
                 continue
             if shared.get(core, 0) > 1:
                 var = fund_variant(name)
