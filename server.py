@@ -46,15 +46,25 @@ _executor = ThreadPoolExecutor(max_workers=4)
 def _build_response(question_id: str, question: str, result: dict) -> dict:
     """OverallState → 대회 스키마 5개 string 필드로 변환.
 
-    ⚠️ retrieved_context / think_trace 매핑은 확정 스펙이 아니라 근사치다.
-       팀 합의 후 다시 다듬어야 한다.
+    retrieved_context: state.citations(실제 근거 청크 목록, index/loader.py
+    to_citation() + answer_generator.attach_citations_by_value() 결과)를
+    사람이 읽을 수 있는 형태로 직렬화한다. qa_pairs(LLM 합성 서브답변)가
+    아니라 실제 문서 발췌(snippet)를 근거로 표시한다 — 대회 평가지표
+    "근거 완전성"·"모든 답변에는 근거 문서 표시할 것" 대응.
     """
     answer = result.get("final_answer") or ""
 
-    qa_pairs = result.get("qa_pairs") or []
-    retrieved_context = "\n\n".join(
-        f"[{p.get('qid', '')}] {p.get('answer', '')}" for p in qa_pairs
-    ) or ""
+    citations = result.get("citations") or []
+    lines = []
+    for c in citations:
+        n = c.get("n", "")
+        fund = c.get("fund_name") or c.get("doc_id", "")
+        section = c.get("section") or ""
+        page = c.get("page")
+        page_str = f"p.{page}" if page is not None else ""
+        snippet = c.get("snippet") or ""
+        lines.append(f"[{n}] {fund} / {section} ({page_str})\n{snippet}")
+    retrieved_context = "\n\n".join(lines)
 
     trace = result.get("trace") or []
     think_trace = "\n".join(
@@ -68,7 +78,7 @@ def _build_response(question_id: str, question: str, result: dict) -> dict:
         "think_trace": str(think_trace),
         "answer": str(answer),
     }
-
+    
 
 @app.get("/answer")
 async def answer(
