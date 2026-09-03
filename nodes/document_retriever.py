@@ -43,7 +43,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import config
-from index import get_index, to_citation
+from index import chunk_by_id, get_index, table_neighbor_ids, to_citation
 from llm import embedder
 from state import RAGState
 from utils import Timer, log_message, step, truncate
@@ -154,6 +154,63 @@ def _ensure_named_fund_cards(docs: List[dict], names: List[str]) -> tuple[List[d
     return docs, added
 
 
+def _stitch_table_continuations(docs: List[dict]) -> tuple:
+    """잘린 표의 나머지 조각을 근거 목록에 채운다 (2026-09-02 신설).
+
+    ■ 무엇이 문제였나 — 투자설명서 청크의 41%가 표의 반쪽이다
+      실측: section_chunks 7,721건 중 3,134건(40.6%)이 머리에 「(표 계속)」을
+      달고 있다. 표가 청크 경계에서 잘리면 앞 조각에는 **마지막 행의 값이 없고**,
+      뒤 조각에는 **열 이름이 없다.**
+
+          p47#c010  … 종류C-e  -23.42  36.00  -30.91  19.33      ← 여기서 끊긴다
+          p47#c011  「최근1년 (표 계속)」 33.86  종류F …          ← 나머지 한 칸
+
+      10차 P-E5 는 c010 만 받았고, 비어 있는 C-e 의 마지막 칸을 **바로 윗행
+      (종류C4)의 33.33** 으로 채웠다. 9차는 같은 칸을 p46 의 설정이후 값(2.26%)
+      으로 채웠다 — 차수가 바뀌고 답변 형태가 바뀌어도 **같은 칸**에서 같은
+      실패가 난다.
+
+    ■ 왜 프롬프트가 아니라 검색에서 고치나
+      "빈 칸을 채우지 마라" 는 지시로는 안 된다는 근거가 이 저장소에 이미 있다
+      (거절문구 건에서 프롬프트 지시가 6·7·8차 세 번 연속 안 지켜졌다).
+      **빈 칸이 없게 주는 것**이 확실하다.
+
+    ■ 검색 순위는 건드리지 않는다
+      점수 계산에 끼어들지 않고, 뽑힌 결과의 짝만 뒤에 덧붙인다. 상한이
+      `config.MAX_TABLE_STITCH` 라 근거 목록이 부풀지 않는다.
+
+    반환: (보강된 문서 목록, 이어붙인 chunk_id 목록)
+    """
+    if not (config.STITCH_TABLE_CONTINUATION and docs):
+        return docs, []
+    try:
+        by_id = chunk_by_id()
+    except Exception as e:                      # 코퍼스 문제로 검색을 막지 않는다
+        log_message(f"표 이어붙이기 건너뜀: {e}", "warning")
+        return docs, []
+
+    seen = {d.get("chunk_id") for d in docs}
+    added: List[str] = []
+    for d in list(docs):
+        if len(added) >= config.MAX_TABLE_STITCH:
+            break
+        for nid in table_neighbor_ids(d.get("chunk_id") or ""):
+            if nid in seen or len(added) >= config.MAX_TABLE_STITCH:
+                continue
+            nb = by_id.get(nid)
+            if nb:
+                # ⚠️ 코퍼스 캐시의 dict 를 그대로 넣으면 표식이 전역에 남는다.
+                #    얕은 복사본에 "어느 청크의 짝인지" 를 달아 둔다 —
+                #    채점 단계가 이걸 보고 **짝의 운명을 따르게** 한다
+                #    (document_grader 의 STITCH 주석 참고).
+                nb = dict(nb)
+                nb["stitched_from"] = d.get("chunk_id")
+                docs.append(nb)
+                seen.add(nid)
+                added.append(nid)
+    return docs, added
+
+
 def _merge_hits(*hit_lists: List[dict]) -> List[dict]:
     """여러 질의의 검색 결과를 chunk_id 기준으로 합친다 (같은 청크는 최고점 유지)."""
     best: Dict[str, dict] = {}
@@ -219,6 +276,9 @@ def retrieve_documents(state: RAGState) -> dict:
     docs, filled = _ensure_named_fund_cards(
         docs, list(base_filters.get("fund_name") or []))
 
+    # 표가 청크 경계에서 잘렸으면 나머지 조각도 같이 준다 — 위 주석 참고.
+    docs, stitched = _stitch_table_continuations(docs)
+
     relax_note = (
         "필터 없음(전체검색)" if used_level < 0
         else ("완화 없음" if used_level == 0
@@ -234,6 +294,8 @@ def retrieve_documents(state: RAGState) -> dict:
                f"{relax_note}) 분포={dist}")
     if filled:
         summary += f" | 지목펀드 카드 보강 {len(filled)}건"
+    if stitched:
+        summary += f" | 잘린 표 이어붙임 {len(stitched)}건"
     if applied.get("사유"):
         summary += f" | 사유={applied['사유']}"
     if hyde_doc:
@@ -255,6 +317,7 @@ def retrieve_documents(state: RAGState) -> dict:
                               "filters": applied,
                               "chunk_type_dist": dict(dist),
                               "n_docs": len(docs),
+                              "stitched": stitched,
                               "top_k": top_k,
                               "hyde": truncate(hyde_doc, 120) if hyde_doc else None},
                       ms=t.ms),

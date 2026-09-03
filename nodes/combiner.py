@@ -24,12 +24,13 @@ import re
 from typing import Dict, List, Tuple
 
 import config
-from index import fund_core, fund_names, fund_variant
+from index import (chunk_text_for_values, fund_core, fund_discriminators,
+                   fund_names)
 from llm import llm
-from nodes.answer_generator import attach_citations_by_value
+from nodes.answer_generator import attach_citations_by_value, value_sequence
 from prompt import prompts
 from state import OverallState
-from utils import Timer, step
+from utils import Timer, md_cell_number, md_table_rows, step
 
 log = logging.getLogger(__name__)
 
@@ -243,6 +244,214 @@ _NEGATED = re.compile(r"않|아니|없|높은\s*위험|위험\s*이?\s*높|주�
 _RISKY_GRADE = 2
 
 
+# ==========================================================================
+# 표 축·행 출처 대조 (2026-09-02 신설, 10차 이슈)
+#
+# 10차 P-E5 는 **값 전사가 정확한데도** 표가 틀렸다. 두 표를 합성했다.
+#
+#   첫 표   제목·열라벨은 p47 「나. 연도별 수익률 추이」(최근1년차~최근5년차)
+#           값은 p46 「가. 연평균수익률」 행 그대로 (-23.62 · 1.79 · -10.60 …)
+#   종류C4  -23.62 · 1.79 · -10.60 은 p46, 18.96 · 33.33 은 p47  ← 한 행 안에서 섞였다
+#   종류C-e 마지막 칸이 33.33 인데 실제는 33.86(p47#c011). 바로 윗행 값으로 채웠다
+#
+# `unsupported_values` 는 집합 대조라 셋 다 통과시킨다 — 값이 전부 '어딘가에'
+# 있기 때문이다. 그래서 **순서와 축**을 본다. LLM 호출 0회.
+#
+#   ① 행 혼합   행의 값들이 어느 한 청크에도 **연속으로** 들어 있지 않다
+#   ② 축 불일치 값이 나온 청크에 답변이 붙인 열 이름이 없다
+#
+# 답변은 고치지 않는다 — `unknown_funds`·`asset_claim_facts` 와 같은 형태로
+# 사실을 한 줄 덧붙이고 결과 파일에 필드로 남긴다.
+# ==========================================================================
+
+def _canon_pct(num: str) -> str:
+    """'10.60' -> '10.6%'. `answer_generator._canon` 과 같은 표기로 맞춘다."""
+    whole, _, frac = num.partition(".")
+    frac = frac.rstrip("0")
+    return f"{whole}.{frac}%" if frac else f"{whole}%"
+
+
+def _contiguous(seq: List[str], row: List[str]) -> bool:
+    """`row` 가 `seq` 안에 **연속 구간**으로 들어 있는가 (역순도 인정).
+
+    역순을 인정하는 이유: 답변이 열 순서를 뒤집어 제시하는 것은 정상이다.
+    10차 P-E5 둘째 표는 원문이 24년→20년 순인데 답변은 20년→24년으로 썼고,
+    그건 오류가 아니다. 오류는 **행이 끊기는 것**이다.
+    """
+    n = len(row)
+    if not n or len(seq) < n:
+        return False
+    rev = row[::-1]
+    return any(seq[i:i + n] in (row, rev) for i in range(len(seq) - n + 1))
+
+
+def _axis_labels(cells: List[str]) -> List[str]:
+    """머리행에서 **축 이름**만 (공백·역슬래시 제거).
+
+    숫자만 든 칸과 "연도"·"구분" 같은 일반명사는 뺀다. 남는 것은
+    "최근1년차"·"20.01.01~20.12.31" 처럼 숫자를 품은 라벨이다 — 어느 표에서
+    왔는지 가려 주는 것이 이것들이다.
+    """
+    out = []
+    for c in cells:
+        if md_cell_number(c):
+            continue
+        # 역슬래시는 마크다운 이스케이프(`20.01.01\~`)라 지운다.
+        v = re.sub(r"\s+", "", (c or "").replace(chr(92), ""))
+        # 30자를 넘으면 라벨이 아니라 문장이다 — 줄바꿈이 지워진 답변에서는
+        # 앞 문단이 첫 칸으로 딸려 들어온다.
+        if 3 <= len(v) <= 30 and any(ch.isdigit() for ch in v):
+            out.append(v)
+    return out
+
+
+# 굵은 글씨 소제목 — 목록형 답변에서 계열(행)을 가르는 자리.
+_SERIES_HEAD = re.compile(r"\*\*([^*\n]{1,40}?)\*\*")
+# 값 하나당 이 길이를 넘으면 목록이 아니라 산문이다.
+_SERIES_DENSITY = 60
+# 값이 놓인 구간을 재기 위한 위치 표시.
+_VAL_POS = re.compile(r"-?\d{1,3}(?:\.\d{1,2})?\s*%")
+
+
+def _labelled_series(text: str) -> List[Tuple[str, str]]:
+    """굵은 소제목으로 갈린 **목록형 계열**을 (이름, 본문) 으로 (2026-09-02).
+
+    ■ 왜 표만 보면 안 되나
+      같은 결함이 답변 형태만 바꿔 다시 나온다. 9차 P-E5 는 같은 표를
+      **글머리표 목록**으로 냈고, 거기서도 종류C-e 의 마지막 칸을 p46 의
+      설정이후 값(2.26%)으로 채웠다. 10차는 마크다운 표로 냈고 같은 칸을
+      옆 행 값(33.33)으로 채웠다.
+
+        9차   - **종류 C-e**: 2020년 -23.42% … 2023년 +19.33% 2024년 +2.26%
+        10차  | 종류C-e | 33.33 | 19.33 | -30.91 | 36.00 | -23.42 |
+
+      표만 대조하면 형태를 바꾼 같은 오류를 놓친다.
+
+    ⚠️ 목록에는 **축 대조를 걸지 않는다.** 목록은 열 이름 대신 연도를 직접 쓰는데
+       (`2020년`), 원문 표는 `20.01.01~20.12.31` 로 적는다. 표기가 다른 것 자체는
+       오류가 아니고, 연도 축이 뒤집힌 경우는 `unsupported_values` 가 이미
+       `2020년`~`2024년` 으로 잡는다(9차 P-E5 의 진짜 오류 5건이 그것이다).
+    """
+    out: List[Tuple[str, str]] = []
+    marks = list(_SERIES_HEAD.finditer(text))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        seg = text[m.end():end]
+        # 값이 놓인 구간만 남긴다 — 뒤에 붙은 설명 문단까지 세면 목록이 산문으로
+        # 오판된다(9차 P-E5 가 이 경우였다).
+        hits = list(_VAL_POS.finditer(seg))
+        if hits:
+            seg = seg[hits[0].start():hits[-1].end()]
+        out.append((m.group(1).strip(), seg))
+    return out
+
+
+def _table_axis_conflicts(text: str, docs: List[dict]) -> List[str]:
+    """답변의 표가 자료의 한 표에서 그대로 옮겨진 것인지 대조한다.
+
+    반환: 사람이 읽을 수 있는 지적 문자열 목록 (없으면 빈 목록).
+    """
+    if not (config.CHECK_TABLE_AXIS and text):
+        return []
+    rows = md_table_rows(text)
+    minc = max(2, config.TABLE_AXIS_MIN_CELLS)
+
+    # 근거 청크의 값 나열 — 순서 그대로.
+    seqs = []
+    for ch in docs:
+        seq = value_sequence(chunk_text_for_values(ch))
+        if len(seq) >= minc:
+            seqs.append((ch, seq,
+                         re.sub(r"\s+", "", chunk_text_for_values(ch))))
+    if not seqs:
+        return []
+
+    # 표 단위로 자른다 — 숫자 칸이 없는 행(머리행)이 나오면 새 표로 본다.
+    tables: List[dict] = []
+    cur = None
+    for cells in (rows if len(rows) >= 2 else []):
+        nums = [md_cell_number(c) for c in cells]
+        nums = [n for n in nums if n]
+        if len(nums) < minc:
+            cur = {"head": cells, "rows": []}
+            tables.append(cur)
+            continue
+        if cur is None:
+            cur = {"head": [], "rows": []}
+            tables.append(cur)
+        cur["rows"].append((cells, nums))
+
+    out: List[str] = []
+
+    # ── 목록형 계열 — 표가 아닌 형태로 낸 같은 표 (위 `_labelled_series` 참고)
+    for name, seg in _labelled_series(text):
+        vals = value_sequence(seg)
+        # ⚠️ 값이 4개 이상이고 **전부 서로 달라야** 계열로 본다.
+        #    소제목 밑에 서로 다른 항목을 나열한 목록(총보수 4.26% · 1년 4.26% ·
+        #    3년 4.44% …)은 값이 겹치고 짧아서, 이 조건이 없으면 전부 걸린다
+        #    (10차 P-A2 에서 확인). 5년 수익률 같은 진짜 계열은 값이 겹치지 않는다.
+        if len(vals) < max(minc + 1, 4) or len(set(vals)) != len(vals):
+            continue
+        if len(seg) > _SERIES_DENSITY * len(vals):
+            continue
+        if any(_contiguous(seq, vals) for _, seq, _ in seqs):
+            continue
+        # ⚠️ 목록은 표보다 판정을 좁힌다. 굵은 소제목 밑에 **서로 다른 항목**을
+        #    나열한 목록(총보수·위험등급·수익률…)이 있어서, 표와 같은 기준을
+        #    걸면 그런 목록이 전부 걸린다(10차 P-A2 에서 확인).
+        #    "한 행을 옮기다 끝 한 칸을 다른 데서 채웠다" 는 형태만 잡는다 —
+        #    9차·10차 P-E5 의 종류C-e 가 정확히 그 형태다.
+        if any(_contiguous(seq, vals[:-1]) or _contiguous(seq, vals[1:])
+               for _, seq, _ in seqs):
+            msg = (f"'{name[:20]}' 항목의 수치 중 한 칸이 다른 표에서 "
+                   f"온 것으로 보입니다")
+            if msg not in out:
+                out.append(msg)
+
+    for t in tables:
+        # 행이 하나뿐인 표는 보지 않는다 — 나열형 문장과 구분이 안 된다.
+        if len(t["rows"]) < 2:
+            continue
+        sources = []            # 이 표의 행을 통째로 담고 있던 청크들
+        for cells, nums in t["rows"]:
+            row_vals = [_canon_pct(n) for n in nums]
+            full = [c for c, seq, _ in seqs if _contiguous(seq, row_vals)]
+            if full:
+                sources.extend(full)
+                continue
+            # 통째로는 없다. 절반 이상을 담은 청크가 있으면 **옮기다 섞인 것**이다.
+            # (절반도 없으면 애초에 전사가 아니므로 unsupported_values 가 볼 일이다)
+            best = max((len(set(row_vals) & set(seq)) for _, seq, _ in seqs),
+                       default=0)
+            if best * 2 >= len(row_vals):
+                name = (cells[0] or "").strip()[:20] or "(이름 없는 행)"
+                msg = f"'{name}' 행은 자료의 한 표에 연속으로 있지 않습니다"
+                if msg not in out:
+                    out.append(msg)
+
+        # 축 대조 — 값이 나온 청크에 답변이 붙인 열 이름이 있는가.
+        labels = _axis_labels(t["head"])
+        if sources and labels:
+            bodies = [body for ch, _, body in seqs if ch in sources]
+            hit = max((sum(1 for L in labels if L in b) for b in bodies),
+                      default=0)
+            # ⚠️ 과반이 아니라 **하나라도 없으면** 잡는다 (2026-09-02, 10차 검증 실행 실측).
+            #    10차 검증 실행 P-E5 는 p46 「가. 연평균수익률」 표를 통째로 정확히 옮겼는데
+            #    열 이름만 `최근1년·2년·3년·4년·5년` 으로 달았다. 원문 축은
+            #    `최근1년·2년·3년·5년·설정이후` 라서 **`최근4년` 은 없는 열**이고
+            #    마지막 칸은 설정이후 값이다. 과반(4/5) 기준으로는 통과한다.
+            #    숫자를 품은 축 이름이 근거에 없다는 것은 표기 차이가 아니라
+            #    없는 열을 만든 것이다. 9·10차와 검증 실행 234개 답변 재판정에서 이
+            #    기준의 오탐은 0건이었다.
+            if hit < len(labels):
+                miss = next((L for L in labels
+                             if not any(L in b for b in bodies)), labels[0])
+                msg = f"열 이름 '{miss}' 이 값이 나온 표에는 없습니다"
+                if msg not in out:
+                    out.append(msg)
+    return out[:5]
+
+
 def _asset_claim_conflicts(text: str, docs: List[dict]) -> List[str]:
     """답변 서술이 카드와 어긋나는 곳을 찾아 **카드 사실**을 돌려준다.
 
@@ -325,9 +534,13 @@ def _asset_claim_conflicts(text: str, docs: List[dict]) -> List[str]:
             if any(o != core and core in o and o in sent for o in all_cores):
                 continue
             if shared.get(core, 0) > 1:
-                var = fund_variant(name)
-                if not var or re.sub(r"\s+", "", var) not in sent:
-                    continue        # 형제 중 어느 것인지 문장이 특정하지 않았다
+                # 형제 중 어느 것인지 문장이 특정했는가.
+                # ⚠️ 변별자가 겹치는 군(베어링고배당: 둘 다 "(주식)")은 상품형태
+                #    까지 봐야 갈린다 — answer_generator._named_funds 와 같은 규칙.
+                sibs = sorted(n for n in cards if fund_core(n) == core)
+                keys = fund_discriminators(name, sibs)
+                if not keys or not any(k in re.sub(r"\s+", "", sent) for k in keys):
+                    continue
 
             # ① 자산유형 역전 — 반대 단어만 있고 맞는 단어는 없을 때
             bad_asset = False
@@ -570,9 +783,17 @@ def combine_answer(state: OverallState) -> dict:
                 seen.add(cid)
                 ordered.append(ch)
     # 서브질문까지 합쳐 넘긴다 — 클래스코드 판정 기준을 generate_answer 와 맞춘다.
+    # 계산기가 낸 값도 근거다 — 검색 청크에는 있을 수 없다(위 `extra_text` 주석).
+    calc_text = "\n".join(
+        [str(calc.get("explanation") or "")]
+        + [str(x) for x in (calc.get("steps") or [])]
+        + [f"{k}: {v:,.0f}원" if isinstance(v, (int, float)) else f"{k}: {v}"
+           for k, v in calc.items()
+           if k not in ("steps", "assumptions", "tool", "explanation", "args")])
     _, unsupported = attach_citations_by_value(
         body + tail, ordered, [],
-        question=" ".join([question] + [p.get("question") or "" for p in rebuilt]))
+        question=" ".join([question] + [p.get("question") or "" for p in rebuilt]),
+        extra_text=calc_text)
 
     # ── 서술형 오류 고지 (2026-08-31, 9차 이슈 1·6-b) ────────────────────
     #
@@ -591,6 +812,13 @@ def combine_answer(state: OverallState) -> dict:
             facts="; ".join(asset_facts))
         log.warning("자산유형 서술이 카드와 어긋납니다: %s", asset_facts)
 
+    # 표를 두 출처에서 합성했는지 — 값이 다 맞아도 축이 틀릴 수 있다.
+    table_axis = _table_axis_conflicts(body, ordered)
+    if table_axis:
+        tail += "\n\n" + config.TABLE_AXIS_NOTE.format(
+            rows="; ".join(table_axis))
+        log.warning("표가 한 출처에서 옮겨진 것이 아닙니다: %s", table_axis)
+
     # 검증에 전부 떨어진 답변은 그 사실을 반드시 밝힌다 (프롬프트 지시와 이중).
     if unverified_all and config.UNVERIFIED_NOTE not in body:
         tail += f"\n\n{config.UNVERIFIED_NOTE}"
@@ -606,6 +834,7 @@ def combine_answer(state: OverallState) -> dict:
         # 값 대조가 못 잡는 두 유형을 결과 파일에서 바로 셀 수 있게 남긴다.
         "unknown_funds": unknown_funds,
         "asset_claim_facts": asset_facts,
+        "table_axis_conflicts": table_axis,
         "all_subs_unverified": unverified_all,
         "llm_calls": used_llm,
         "trace": step("combine_answer",
@@ -619,7 +848,9 @@ def combine_answer(state: OverallState) -> dict:
                               + (f", ⚠미확인 상품명 {len(unknown_funds)}건"
                                  if unknown_funds else "")
                               + (f", ⚠자산유형 서술 불일치 {len(asset_facts)}건"
-                                 if asset_facts else ""),
+                                 if asset_facts else "")
+                              + (f", ⚠표 출처 불일치 {len(table_axis)}건"
+                                 if table_axis else ""),
                       ms=ms),
     }
 

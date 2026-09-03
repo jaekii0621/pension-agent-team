@@ -255,6 +255,9 @@ _FUND_TAIL = re.compile(r"증권|투자신탁|자투자|[\[(]")
 # 변별자 — 이름 끝의 괄호/대괄호 안 내용. "(국공채)" · "[주식]" · "(채권)"
 _FUND_VARIANT = re.compile(r"[\[(]\s*([^\[\]()]{1,20})\s*[\])]\s*$")
 
+# 상품형태 — 변별자가 겹치는 형제를 가르는 마지막 축 (`fund_discriminators`).
+_FUND_FORM = re.compile(r"자투자신탁|투자신탁|투자회사")
+
 # 호수 — "제1호" · "1호" · "2호". 괄호가 없는 형제(1호/2호)를 가른다.
 _FUND_SERIES = re.compile(r"제?\s*(\d{1,2})\s*호")
 
@@ -283,6 +286,48 @@ def fund_variant(name: str) -> str:
         return re.sub(r"\s+", "", m.group(1))
     s = _FUND_SERIES.search(name or "")
     return f"{s.group(1)}호" if s else ""
+
+
+def fund_discriminators(name: str, group: List[str]) -> List[str]:
+    """형제군 안에서 `name` 을 **혼자만** 가리키는 문자열들 (공백 제거).
+
+    ■ 왜 `fund_variant()` 하나로 부족한가 (2026-09-02, 코퍼스 실측)
+      괄호 변별자가 형제끼리 **같은** 군이 있다.
+
+          베어링 고배당 증권 투자회사(주식)      -> variant '주식'
+          베어링 고배당 증권자투자신탁(주식)      -> variant '주식'
+
+      이 군에서 변별자만 보면 답변이 "베어링 고배당 … 주식형" 이라고만 써도
+      **두 펀드가 모두 지목된 것으로 판정된다.** 지목 판정이 정밀도 가드인데
+      여기서는 가드가 열려 버린다.
+
+      그래서 변별자가 겹치면 상품형태("투자회사"·"자투자신탁"·"투자신탁")를
+      뒤에 더 본다. 그래도 안 갈리면 **빈 목록**을 돌려준다 — 특정할 수 없다는
+      뜻이고, 호출부는 "펀드 특정 없음" 경로로 가야 한다.
+
+    ■ 왜 정식 명칭 전체를 쓰지 않나
+      답변도 질문도 펀드를 축약해 부른다("베어링 고배당 주식형"). 정식 명칭
+      전체로 대조하면 어느 형제도 안 걸려서 가드가 반대 방향으로 무력해진다.
+    """
+    others = [o for o in group if o != name]
+    if not others:
+        v = fund_variant(name)
+        return [re.sub(r"\s+", "", v)] if v else []
+
+    mine = fund_variant(name)
+    if mine and all(fund_variant(o) != mine for o in others):
+        return [re.sub(r"\s+", "", mine)]
+
+    # 변별자가 겹친다 — 상품형태를 덧붙여 다시 시도한다.
+    def _form(n: str) -> str:
+        m = _FUND_FORM.search(n or "")
+        return m.group(0) if m else ""
+
+    mine_form = _form(name)
+    if mine_form and all(_form(o) != mine_form for o in others):
+        joined = mine_form + mine if mine else mine_form
+        return [re.sub(r"\s+", "", joined)]
+    return []
 
 
 def _fund_groups() -> Dict[str, List[str]]:
@@ -414,6 +459,111 @@ def is_table_chunk(c: dict) -> bool:
     if (c.get("origin") or "") in config.TABLE_ORIGINS:
         return True
     return str(c.get("section") or "").startswith(config.TABLE_SECTION_PREFIXES)
+
+
+# 표가 청크 경계에서 잘렸을 때 뒤 조각의 머리에 붙는 표시.
+# 실측: section_chunks 7,721건 중 3,134건(40.6%)이 이걸 달고 있다.
+_TABLE_CONT = "(표 계속)"
+# 청크 id 는 "<doc>#p<페이지>#c<번호>" 형태다.
+_CHUNK_ID = re.compile(r"^(.*#p\d+#c)(\d+)$")
+
+
+@lru_cache(maxsize=1)
+def chunk_by_id() -> Dict[str, dict]:
+    """chunk_id -> 청크. 이웃 청크를 id 로 찾아올 때 쓴다."""
+    return {c["chunk_id"]: c for c in load_corpus() if c.get("chunk_id")}
+
+
+def is_table_continuation(c: dict) -> bool:
+    """이 청크가 **앞 청크에서 잘린 표의 뒷부분**인가.
+
+    뒷조각은 열 머리가 없다 — 「최근1년 (표 계속)」 처럼 첫 열 이름 한 개만
+    남는다. 그래서 단독으로 주면 어느 표의 어느 열인지 알 수 없고, 반대로
+    앞조각만 주면 마지막 행들의 값이 통째로 빠진다.
+    """
+    return _TABLE_CONT in (c.get("text") or "")[:200]
+
+
+def table_neighbor_ids(chunk_id: str) -> List[str]:
+    """잘린 표를 복원하려면 같이 봐야 하는 이웃 청크 id 목록 (없으면 빈 목록).
+
+    ■ 양방향이다
+      · 이 청크가 뒷조각이면  → 앞 조각(열 머리가 있는 쪽)
+      · 이 청크 다음이 뒷조각이면 → 그 뒷조각(남은 행·칸이 있는 쪽)
+
+    ■ 왜 id 산술로 찾나
+      청크 스키마에 이웃 포인터가 없다. id 가 `#c010` → `#c011` 로 **연속**이고
+      같은 문서·같은 페이지 안에서만 이어지므로, 번호 ±1 로 찾은 뒤 문서·섹션이
+      같은지 확인하면 충분하다. 페이지를 넘어가는 표는 잇지 않는다 — 페이지가
+      바뀌면 표 머리가 다시 인쇄되므로 앞조각이 이미 완결이다.
+    """
+    m = _CHUNK_ID.match(chunk_id or "")
+    if not m:
+        return []
+    head, num = m.group(1), m.group(2)
+    by_id = chunk_by_id()
+    me = by_id.get(chunk_id)
+    if not me:
+        return []
+    width = len(num)
+    out: List[str] = []
+    for delta in (-1, 1):
+        nid = f"{head}{int(num) + delta:0{width}d}"
+        nb = by_id.get(nid)
+        if not nb or nb.get("doc_id") != me.get("doc_id"):
+            continue
+        if nb.get("section") != me.get("section"):
+            continue
+        # 뒤쪽 조각이 「(표 계속)」인 경우에만 잇는다. 앞으로 갈 때는 내가 뒷조각일 때.
+        later = nb if delta > 0 else me
+        if is_table_continuation(later):
+            out.append(nid)
+    return out
+
+
+# 단위 선언 줄 — 표 머리에 한 번만 인쇄되므로 뒤 조각은 이걸 잃는다.
+_UNIT_LINE = re.compile(r"^.*단위\s*[:：]?\s*\(?\s*%.*$", re.M)
+
+
+def chunk_text_for_values(c: dict) -> str:
+    """값 대조가 볼 본문. 표 연속 청크는 앞 조각의 **단위 선언 줄**을 이어 붙인다.
+
+    ■ 왜 필요한가 (2026-09-02)
+      "이 표의 숫자는 %다" 는 선언이 표 머리에 **한 번만** 인쇄된다. 표가 청크
+      경계에서 잘리면 뒤 조각에는 선언이 없다.
+
+          p47#c010  나. 연도별 수익률 추이(단위:%)   … 종류C-e -23.42 36.00 …
+          p47#c011  최근1년 (표 계속)  33.86  종류F …  투자신탁 -22.43 37.62 …
+                    └ 선언이 없어서 이 조각의 값은 **하나도 추출되지 않는다**
+
+      10차 P-E5 답변의 투자신탁·비교지수 행(35.68 · 20.87 · 37.62 …)은 전부
+      c011 의 값인데, 그 조각을 근거로 줘도 값 대조가 못 읽는다. 잘린 표의
+      뒷조각이 section_chunks 의 40.6% 라 이 구멍은 넓다.
+
+    ■ 선언 줄만 가져온다
+      앞 조각을 통째로 붙이면 **앞 조각의 값이 이 조각에 있는 것으로 잡힌다.**
+      선언 줄에는 값이 없으므로 그 줄만 붙이면 부작용이 없다.
+    """
+    text = c.get("text") or ""
+    if not is_table_continuation(c) or _UNIT_LINE.search(text):
+        return text
+    by_id = chunk_by_id()
+    cid = c.get("chunk_id") or ""
+    m = _CHUNK_ID.match(cid)
+    if not m:
+        return text
+    head, num, width = m.group(1), int(m.group(2)), len(m.group(2))
+    # 연속 조각이 여러 개일 수 있다 — 선언이 나올 때까지 앞으로 몇 칸만 본다.
+    for back in range(1, 4):
+        prev = by_id.get(f"{head}{num - back:0{width}d}")
+        if not prev or prev.get("doc_id") != c.get("doc_id"):
+            break
+        found = _UNIT_LINE.search(prev.get("text") or "")
+        if found:
+            return found.group(0) + "\n" + text
+        if not is_table_continuation(prev):
+            break
+    return text
 
 
 def format_chunk_for_llm(chunk: dict, idx: Optional[int] = None) -> str:

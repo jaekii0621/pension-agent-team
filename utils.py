@@ -188,9 +188,94 @@ def tokenize_ko(text: str) -> List[str]:
     return out
 
 
+# ==========================================================================
+# 마크다운 표 읽기 (2026-09-02 신설)
+#
+# 답변이 수치를 내놓는 자리는 거의 전부 마크다운 표다. 그런데 값 대조는 표를
+# **글자 흐름**으로만 보고 있었다. 그래서 두 가지가 안 보였다.
+#
+#   ① 셀에 `%` 를 안 붙인 맨숫자 (10차 P-E5: `| 종류A | -23.62 | 1.79 | …`)
+#      → 답변 쪽에서 값 토큰이 **하나도** 안 나와 `unsupported_values` 가
+#        0으로 찍혔다. "다 검증됐다" 가 아니라 "볼 것이 없었다" 였다.
+#        (9차 답변은 같은 표를 `-23.62%` 로 써서 20개가 잡혔다 — 지표가
+#         답변의 표기 습관에 따라 켜졌다 꺼졌다 한 것이다)
+#   ② 행 단위 구조 — 어느 값들이 한 행에 같이 있었나
+#      → 두 표를 한 행 안에서 섞어도 값은 전부 '어딘가에' 있으므로 통과했다.
+#
+# ⚠️ 결과 파일(run_queryset)은 답변의 줄바꿈을 지우고 한 줄로 적는다. 저장된
+#    답변으로 사후 검증을 돌리면 표가 통째로 한 줄이 되므로, 행 경계 `| |` 를
+#    줄바꿈으로 되돌려 **실행 중이든 사후든 같은 결과**가 나오게 한다.
+# ==========================================================================
+
+# 한 행의 끝 `|` 과 다음 행의 시작 `|` 이 붙어 있는 자리.
+_ROW_JOIN = re.compile(r"\|[ \t]+\|")
+# 구분행 `|---|---|`
+_SEP_ROW = re.compile(r"^[\s|:\-–—]+$")
+
+
+def md_table_rows(text: str) -> List[List[str]]:
+    """마크다운 표의 행들을 셀 목록으로 돌려준다 (구분행 제외).
+
+    표가 아닌 줄은 버린다. 셀은 양끝 공백을 지운 문자열이다.
+    """
+    t = _ROW_JOIN.sub("|" + chr(10) + "|", text or "")
+    rows: List[List[str]] = []
+    for line in t.splitlines():
+        line = line.strip()
+        if line.count("|") < 3 or _SEP_ROW.match(line):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) >= 2:
+            rows.extend(_split_trailing_head(cells))
+    return rows
+
+
+def _split_trailing_head(cells: List[str]) -> List[List[str]]:
+    """숫자 칸 뒤에 붙은 **다음 표의 머리행**을 떼어낸다.
+
+    줄바꿈이 지워진 답변에서는 앞 표의 마지막 행과 다음 표의 제목·머리행이
+    한 줄로 붙는다. 그대로 두면 두 표가 한 표로 읽혀 표 대조가 무력해진다.
+
+        | 종류C4 | -23.62 | … | 33.33 |  *이 정보는… | 연도 | 20.01.01~ | …
+                                          └─ 여기부터는 다음 표다
+    """
+    nums = [i for i, c in enumerate(cells) if md_cell_number(c)]
+    if not nums:
+        return [cells]
+    tail = cells[nums[-1] + 1:]
+    if len(tail) >= 2 and not any(md_cell_number(c) for c in tail):
+        return [cells[:nums[-1] + 1], tail]
+    return [cells]
+
+
+# 숫자만 든 셀. 부호·천단위쉼표·꼬리 `%` 는 허용하되 **소수점이 있어야** 한다.
+#   소수점을 요구하는 이유: 정수 칸은 금액·좌수·연도라 백분율로 읽으면 안 된다.
+#   (투자설명서 실적표의 값은 전부 소수 1~2자리다)
+_NUM_CELL = re.compile(r"^[▲▼△▽+\-−]?\s*(\d{1,3}(?:,\d{3})*\.\d{1,2})\s*%?$")
+
+
+def md_cell_number(cell: str) -> str:
+    """셀이 순수한 소수 하나면 그 값(부호·쉼표 제거)을, 아니면 빈 문자열."""
+    m = _NUM_CELL.match((cell or "").strip())
+    return m.group(1).replace(",", "") if m else ""
+
+
 def truncate(text: str, n: int = 200) -> str:
+    """**로그 한 줄**용. 줄바꿈을 지운다."""
     text = (text or "").replace("\n", " ").strip()
     return text if len(text) <= n else text[:n] + "…"
+
+
+def clip(text: str, n: int) -> str:
+    """길이만 자르고 **줄바꿈은 남긴다** (2026-09-02 신설).
+
+    결과 파일의 `answer` 를 `truncate()` 로 적고 있었다. 그래서 저장된 답변은
+    표가 통째로 한 줄이 된다 — 사람이 읽기 어렵고, 저장된 답변으로 표 대조를
+    다시 돌리면 실행 중과 **다른 결과**가 나온다.
+    잘라내는 것은 그대로 두되 구조는 보존한다.
+    """
+    text = text or ""
+    return text if not n or len(text) <= n else text[:n] + "…"
 
 
 def fmt_won(v: float) -> str:

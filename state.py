@@ -221,6 +221,9 @@ class OverallState(TypedDict, total=False):
     #    읽는 값이 늘 빈 목록이었다 — 같이 선언한다.
     unknown_funds: Annotated[Optional[List[str]], keep_last]
     asset_claim_facts: Annotated[Optional[List[str]], keep_last]
+    # 표를 두 출처에서 합성했는지 (2026-09-02, 10차 이슈).
+    # 값이 전부 맞아도 축이 틀릴 수 있어 `unsupported_values` 와 별개 축이다.
+    table_axis_conflicts: Annotated[Optional[List[str]], keep_last]
     all_subs_unverified: Annotated[Optional[bool], keep_last]
     dangling_cites: Annotated[Optional[List[int]], keep_last]
 

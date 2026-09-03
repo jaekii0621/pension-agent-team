@@ -46,7 +46,7 @@ from typing import Any, Dict, List, Optional
 
 import config
 import utils  # noqa: F401  — stdout 을 UTF-8 로 고정 (Windows cp949 대비)
-from utils import log_message, truncate
+from utils import clip, log_message, truncate
 
 QUERYSET_PATH = Path(__file__).resolve().parent / "queryset.jsonl"
 
@@ -277,7 +277,9 @@ def run_case(case: dict, *, max_answer: int = 8000) -> Dict[str, Any]:
         "expect": case.get("expect"),
 
         # --- 결과 ---
-        "answer": truncate(answer, max_answer) if max_answer else answer,
+        # ⚠️ `truncate` 가 아니다 — 줄바꿈을 지우면 표 구조가 사라져
+        #    저장된 답변으로 표 대조를 다시 돌릴 수 없다.
+        "answer": clip(answer, max_answer),
         "answer_len": len(answer),
         "answer_truncated": bool(max_answer and len(answer) > max_answer),
 
@@ -351,6 +353,8 @@ def run_case(case: dict, *, max_answer: int = 8000) -> Dict[str, Any]:
         # 셋 다 문자열 대조로 계산한다 — LLM 호출이 늘지 않는다.
         "unknown_funds": result.get("unknown_funds") or [],
         "asset_claim_facts": result.get("asset_claim_facts") or [],
+        # 표 합성 (2026-09-02, 10차 이슈) — 값이 다 맞아도 축이 틀린 경우.
+        "table_axis_conflicts": result.get("table_axis_conflicts") or [],
         "all_subs_unverified": bool(result.get("all_subs_unverified")),
 
         # ── 429 재시도 기록 (2026-08-31 신설) ────────────────────────────
@@ -394,7 +398,8 @@ COMPACT_KEYS = [
     "n_citations", "cite_dist", "retrieval_dist", "dangling_cites",
     "unsupported_values", "unsupported_values_pre", "unsupported_values_new",
     # 값 대조가 원리상 못 잡는 서술형 오류 두 종 (2026-08-31)
-    "unknown_funds", "asset_claim_facts", "all_subs_unverified",
+    "unknown_funds", "asset_claim_facts", "table_axis_conflicts",
+    "all_subs_unverified",
     "evidence_sufficient", "salvage",
     "citations", "retrieval",
 

@@ -71,6 +71,66 @@ def grade_documents(state: RAGState) -> dict:
                 "trace": step("grade_documents", qid=qid,
                               summary=f"건너뜀 (문서 {len(docs)}건)")}
 
+    # ── 이어붙인 표 조각은 채점 대상에서 뺀다 (2026-09-02, 10차 검증 실행 회귀) ──
+    #
+    # ■ 무엇이 깨졌었나
+    #   `_stitch_table_continuations` 가 잘린 표의 짝을 **문서 목록 뒤에**
+    #   덧붙인다. 그런데 아래 `head/tail` 분할은 상위 GRADE_LIMIT(8)개만 채점하고
+    #   **나머지는 무조건 통과**시킨다. top_k=8 일 때 예전에는 tail 이 비어서
+    #   "전부 탈락 → kept 가 빈 목록 → 전멸 폴백" 이 돌았는데, 이어붙인 조각이
+    #   tail 로 들어가면서 kept 가 절대 비지 않게 됐다.
+    #
+    #   결과: 폴백이 죽고, 살아남은 근거가 **열 머리 없는 표 뒷조각뿐**이 된다.
+    #   10차 검증 실행 실측 — 신규 게이트 거절 6건(D-A4·D-D2·D-F5·D-H3·P-E1·P-E4)이
+    #   전부 이어붙이기가 발동한 문항이었다. D-A4 는 evidence_ok 가 True→False,
+    #   인용 1→0 으로 뒤집혔다.
+    #
+    # ■ 짝은 짝의 운명을 따른다
+    #   뒷조각은 독립된 근거가 아니라 **앞조각의 나머지**다. 따로 채점하면
+    #   맥락이 없어 무관 판정이 나고, 안 하고 통과시키면 위처럼 폴백을 막는다.
+    #   그래서 채점에서 빼 두었다가 **앞조각이 살아남았을 때만** 다시 붙인다.
+    #   채점 호출 수도 예전과 같아진다 (이어붙인 만큼 늘지 않는다).
+    stitched = [d for d in docs if d.get("stitched_from")]
+    docs = [d for d in docs if not d.get("stitched_from")]
+
+    # ── 질문이 지목한 펀드의 카드는 채점에서 뺀다 (2026-09-02, 4차수 회귀) ──
+    #
+    # ■ 무엇이 반복됐나
+    #   8·9·10차와 검증 실행 내내 상품 트랙 문항이 "제공된 자료에서 근거를 찾지 못했습니다"
+    #   로 나갔다. **걸리는 문항이 매 차수 달라서** 특정 질문의 문제로 안 보였다.
+    #
+    #   10차 검증 실행 실측 — 실패한 상품 문항 7건 전부 `retrieval` 분포에
+    #   `prospectus/fund_card: 1` 이 찍혀 있다. 즉 **검색은 그 펀드 카드를 이미
+    #   가져왔다.** 그리고 그 카드에 답이 글자 그대로 있다.
+    #
+    #       P-E4 삼성ABF   카드: "매매회전율: 해당없음(주식 매매 지표 없음)"
+    #                      기대: 해당없음과 미확인을 구분하라
+    #       P-E1 키움연금   카드: "총보수: 0.31% (종류형 아님 — 클래스 구분 없음)"
+    #                      기대: 종류형이 아니라고 답하라. 결손이 아니다
+    #
+    #   버린 것은 검색이 아니라 **이 채점 단계**다. 채점은 LLM 이라 판정이 흔들리고,
+    #   그래서 매 차수 다른 문항이 걸린다(9차 검토서 §5 가 관측한 그 변동성이다).
+    #
+    # ■ 왜 카드만 고정하나
+    #   펀드카드·클래스카드는 우리가 그 펀드 하나를 정리해 만든 **정본**이다.
+    #   "이 펀드에 대한 질문" 에서 그 펀드의 카드가 무관일 수 없다 — 무관 판정이
+    #   나오면 그건 채점기가 틀린 것이다. 반대로 섹션 원문은 88개나 되므로
+    #   채점이 걸러 줄 값어치가 있다. 그래서 **지목된 펀드의 카드에만** 건다.
+    #
+    #   질문이 펀드를 지목하지 않았으면(`fund_name` 필터 없음) 아무것도 고정하지
+    #   않는다 — 예전 동작 그대로다.
+    #   ⚠️ `applied_filters` 가 아니라 **원래 필터**를 본다. 완화 2단계는 후보를
+    #      넓히려고 fund_name 을 비우는 것이지, 질문이 그 펀드를 안 말한 게 아니다
+    #      (`_ensure_named_fund_cards` 가 `base_filters` 를 보는 것과 같은 이유).
+    pinned_names = {n for n in ((state.get("filters") or {}).get("fund_name")
+                                or []) if n}
+    pinned = [d for d in docs
+              if d.get("chunk_type") in ("fund_card", "class_card")
+              and (d.get("fund") or {}).get("name") in pinned_names]
+    if pinned:
+        pin_ids = {d.get("chunk_id") for d in pinned}
+        docs = [d for d in docs if d.get("chunk_id") not in pin_ids]
+
     head, tail = docs[:GRADE_LIMIT], docs[GRADE_LIMIT:]
 
     with Timer() as t:
@@ -107,6 +167,14 @@ def grade_documents(state: RAGState) -> dict:
         log_message(f"문서 채점 전멸({len(head)}건 전부 탈락) → 검색 상위 "
                     f"{rescued}건을 살립니다", "warning")
 
+    # 지목 펀드 카드는 채점 결과와 무관하게 **맨 앞에** 되돌린다 (위 주석 참고).
+    kept = pinned + kept
+
+    # 살아남은 앞조각의 짝만 되붙인다 (위 주석 참고).
+    keep_ids = {c.get("chunk_id") for c in kept}
+    restitched = [c for c in stitched if c.get("stitched_from") in keep_ids]
+    kept = kept + restitched
+
     return {
         "documents": kept,
         "irrelevance_reason": reasons,
@@ -115,7 +183,13 @@ def grade_documents(state: RAGState) -> dict:
         "trace": step("grade_documents", qid=qid,
                       summary=f"{len(head)}건 채점 → {len(kept)}건 통과 "
                               f"(탈락 {len(dropped)}건)"
-                              + (f" ⚠전멸 폴백 {rescued}건" if rescued else ""),
+                              + (f" ⚠전멸 폴백 {rescued}건" if rescued else "")
+                              + (f", 지목펀드 카드 {len(pinned)}건 고정"
+                                 if pinned else "")
+                              + (f", 표 짝 {len(restitched)}건 유지"
+                                 if restitched else "")
+                              + (f", 표 짝 {len(stitched) - len(restitched)}건 탈락"
+                                 if len(stitched) > len(restitched) else ""),
                       detail={"drop_reasons": reasons},
                       ms=t.ms),
     }

@@ -32,11 +32,12 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 import config
-from index import format_chunk_for_llm, fund_core, fund_variant, to_citation
+from index import (chunk_text_for_values, format_chunk_for_llm, fund_core,
+                   fund_discriminators, to_citation)
 from llm import llm
 from prompt import prompts
 from state import RAGState
-from utils import Timer, step, truncate
+from utils import Timer, md_cell_number, md_table_rows, step, truncate
 
 log = logging.getLogger(__name__)
 
@@ -215,10 +216,16 @@ _TOK_GRADE = re.compile(r"(?:위험)?등급\s*([1-6])|([1-6])\s*등급")
 #   쓰므로 답변 쪽에서만 토큰이 나오고, 교집합이 비어 근거 있는 값이 전부
 #   '근거 없는 값' 으로 잡힌다.
 #
-#   실측: 투자설명서 청크 7,904건 중 412건(5.2%)이 단위를 선언하는데,
-#   그 안의 값은 `%` 표기 423개 대 맨숫자 8,322개다. 지금 규칙은 5%만 읽는다.
-#   섹션 분포도 재무·운용실적 241 · 요약정보 140 으로 **성과 수치가 사는 자리**에
-#   정확히 몰려 있다.
+#   실측 (2026-09-02 재측정 — `scratchpad/audit_counts.py corpus` 로 재현):
+#     대상       투자설명서 청크 7,904건 (section 7,721 + 펀드카드 92 + 클래스카드 91)
+#     이 규칙에 걸리는 청크  263건 (3.3%) — 재무·운용실적 164 · 요약정보 99
+#     그 안의 값 맨숫자 3,951개  대  `%` 표기 148개 (26.7배)
+#
+#   ⚠️ 이 자리에 있던 "412건 / 241:140 / 8,322개 대 423개" 는 재현되지 않는다.
+#      같은 코퍼스에 어떤 정규식을 걸어도 412 도 241:140 도 안 나온다 —
+#      리터럴 `단위:%` 102 · 괄호형 284 · 같은 줄에 단위와 % 423.
+#      **논지는 그대로다**: 선언형 표 안에서 맨숫자가 `%` 표기를 22~27배로
+#      압도하고, 걸린 청크의 62%가 재무·운용실적에 몰려 있다.
 #
 #   9차 `unsupported_values` 35개 중 16개(46%)가 이 경로의 오탐이었다
 #   (P-E5 15 · P-E1 1). P-E5 는 "환각 15개" 로 기록됐지만 실제로는 답변이
@@ -231,10 +238,33 @@ _UNIT_PCT = re.compile(r"단위\s*[:：]?\s*\(?\s*%")
 # 앞뒤로 숫자·소수점·% 가 붙지 않은 소수. 부호는 버린다(`%` 경로와 동일).
 _BARE_DEC = re.compile(r"(?<![\d.,%])-?(\d{1,3}\.\d{1,2})(?![\d.]|\s*%)")
 _TOK_LOW = [
-    re.compile(r"\d+\s*개월"),                         # 3개월
-    re.compile(r"\d+\s*년"),                           # 20년
     re.compile(r"(?<!\.)\b\d{1,3}\s*%"),               # 30%
+    re.compile(r"(?<!\d)(?:19|20)\d{2}\s*년(?!차)"),    # 2024년 — 연도 축 주장
 ]
+
+# ── 기간 라벨은 값이 아니다 (2026-09-02 신설, 10차 이슈) ──────────────
+#
+# ■ 무엇이 잘못됐었나
+#   `\d+\s*년` · `\d+\s*개월` 이 LOW 값이었다. 그런데 이 코퍼스에서 "최근1년"
+#   "3년" "12개월" 은 **표의 축 이름**이지 답변이 주장한 값이 아니다.
+#   부착 조건이 `LOW 두 개 이상` 이라 기간 라벨 두 개만 겹쳐도 인용이 붙는다.
+#
+#   실측 10차 P-E5 — 인용 3건의 quote 가 전부 이 경로였다.
+#       [1] p47  값 일치: 1년, 2년, 3년, 4년
+#       [2] p48  값 일치: 1년, 2년, 3년, 4년   ← 「자산구성 현황」 페이지다.
+#       [3] p46  값 일치: 1년, 2년, 3년, 5년      차트 축에 "최근1년…" 이 있어
+#                                                근거로 붙었다
+#   답변이 실제로 옮겨 적은 값(35.68 · 20.87 …)이 있는 p47#c011 은 인용에 없다.
+#   **근거표시가 값과 무관하게 붙은 것**이라, 붙은 인용 수가 늘어도 근거가 아니다.
+#
+# ■ 그래서 계층을 하나 더 뺀다 — 클래스코드와 같은 취급
+#   부착 문턱에 세지 않고 동점을 가르는 정렬에만 쓴다. `unsupported_values`
+#   에도 넣지 않는다 — "3년" 이 근거에 없다는 건 오류가 아니라 표기 차이다
+#   (10차 32개 중 7개가 `5년`·`3년`·`30개월` 같은 기간 라벨이었다).
+#
+#   연도(`2024년`)는 LOW 에 남긴다. 축 이름이 아니라 **주장**이고, 9차 P-E5 의
+#   진짜 오류 5건이 정확히 이 토큰으로 잡혔다.
+_TOK_PERIOD = re.compile(r"(?<![\d.])\d{1,2}\s*(?:년차|개월|년)(?![\d차])")
 
 _AUTO_MAX = 3          # 자동 부착 상한 — 목록이 길어지면 오히려 근거가 흐려진다
 
@@ -337,11 +367,70 @@ def _canon(v: str) -> str:
     return v
 
 
-def _tokens(text: str):
-    """(높은 특이도, 낮은 특이도, 클래스코드) 세 집합.
+def _md_table_values(text: str) -> set:
+    """마크다운 표의 **숫자만 든 칸**을 백분율 토큰으로 (2026-09-02 신설).
 
-    클래스코드를 따로 돌려주는 이유는 위 `_TOK_CLASS` 주석 참고 —
-    **이름표라 부착 문턱에 세면 안 된다.**
+    ■ 왜 필요한가 — 지표가 답변의 표기 습관에 따라 켜졌다 꺼졌다 했다
+      `_UNIT_PCT` 는 청크 쪽을 열었다. 그런데 **답변 쪽은 그대로 `%` 를
+      요구하고 있었다.** 답변이 표로 쓰면 셀에 `%` 를 안 붙인다.
+
+        9차 답변  "| 종류A-e | -23.33% | 36.13% |"  → 20개 토큰 → 20개 플래그
+        10차 답변 "| 종류A-e | -23.33  | 36.13  |"  → **0개 토큰** → 0개 플래그
+
+      10차 P-E5 의 `unsupported_values: 0` 은 값이 검증됐다는 뜻이 아니라
+      **볼 것이 없었다**는 뜻이다. 같은 표를 옮긴 같은 답변인데 지표가 뒤집힌다.
+
+    ■ 왜 표 칸으로 한정하나
+      본문 아무 데서나 맨숫자를 값으로 읽으면 조항 번호·페이지·배수가 걸린다.
+      표 칸은 "이 자리는 값이다" 를 답변 스스로 밝힌 자리다. 소수점을 요구해
+      금액·좌수·연도 칸(정수)은 들어오지 않는다 — 청크 쪽 `_BARE_DEC` 와 같은
+      기준이라 양쪽이 어긋나지 않는다.
+    """
+    out = set()
+    for row in md_table_rows(text):
+        for cell in row:
+            v = md_cell_number(cell)
+            if v:
+                out.add(_canon(v + "%"))
+    return out
+
+
+def value_sequence(text: str) -> List[str]:
+    """텍스트에 나온 값들을 **나온 순서 그대로** 돌려준다 (표 행 대조용).
+
+    ■ 왜 집합이 아니라 순서인가 (2026-09-02 신설, 10차 이슈)
+      `unsupported_values` 는 집합이라 "이 값이 어딘가에 있는가" 만 본다.
+      그래서 **한 표의 한 행을 통째로 옮겼는가** 를 못 본다.
+
+        10차 P-E5 종류C-e 행:  33.33 · 19.33 · -30.91 · 36.00 · -23.42
+        p47 원문 종류C-e 행:   -23.42 · 36.00 · -30.91 · 19.33 · (33.86)
+                                                                 └ 뒤 청크로 잘렸다
+
+      33.33 은 **바로 윗행(종류C4)의 값**이다. 값 자체는 같은 청크에 있으므로
+      집합 대조는 통과한다. 순서를 보면 마지막 칸에서 끊긴다.
+
+    투자설명서 표는 셀마다 줄이 바뀌므로 텍스트 순서가 곧 표의 행 순서다.
+    부호는 버린다 — 답변이 `-23.62` 를 `23.62%(손실)` 로 쓰기도 한다.
+    """
+    text = text or ""
+    out: List[str] = []
+    if _UNIT_PCT.search(text):
+        # 단위를 선언한 표 — 맨숫자도 값이다.
+        pat = re.compile(r"(?<![\d.,%])-?(\d{1,3}(?:\.\d{1,2})?)\s*%?(?![\d.])")
+        for m in pat.finditer(text):
+            if "." in m.group(1):              # 소수만 — 정수는 좌수·금액이다
+                out.append(_canon(m.group(1) + "%"))
+    else:
+        for m in re.finditer(r"(?<![\d.,])-?(\d{1,3}\.\d{1,2})\s*%", text):
+            out.append(_canon(m.group(1) + "%"))
+    return out
+
+
+def _tokens(text: str):
+    """(높은 특이도, 낮은 특이도, 클래스코드, 기간라벨) 네 집합.
+
+    클래스코드와 기간라벨을 따로 돌려주는 이유는 위 주석 참고 —
+    **둘 다 이름표라 부착 문턱에 세면 안 된다.**
     """
     text = text or ""
     hi = {_canon(m.group(0)) for p in _TOK_HIGH for m in p.finditer(text)}
@@ -351,9 +440,12 @@ def _tokens(text: str):
     # 표가 "단위:%" 로 선언했으면 맨숫자도 백분율로 읽는다 — 위 주석 참고.
     if _UNIT_PCT.search(text):
         hi |= {_canon(m.group(1) + "%") for m in _BARE_DEC.finditer(text)}
+    # 마크다운 표의 숫자 칸도 같은 기준으로 읽는다 (답변 쪽 대응물).
+    hi |= _md_table_values(text)
     lo = {_canon(m.group(0)) for p in _TOK_LOW for m in p.finditer(text)}
     cls = {_norm(m.group(0)) for p in _TOK_CLASS for m in p.finditer(text)}
-    return hi, lo - hi, cls - hi - lo
+    per = {_norm(m.group(0)) for m in _TOK_PERIOD.finditer(text)}
+    return hi, lo - hi, cls - hi - lo, per - hi - lo - cls
 
 
 def _named_funds(ordered: List[dict], ans_n: str) -> set:
@@ -365,8 +457,20 @@ def _named_funds(ordered: List[dict], ans_n: str) -> set:
       핵심이름만 보므로 "한국투자골드플랜연금(국공채/채권/주식)" 세 펀드가 전부
       같은 조건을 만족한다. "답변이 특정 펀드를 말했으면 그 펀드만 인용" 이라는
       정밀도 가드가 이 상품군에서는 **아예 작동하지 않았다.**
-      코퍼스 실측: 92개 중 11개(5개 군)가 이 구조이고, 그중 4개 군은 등급이나
-      자산유형이 서로 다르다 — 뭉개지면 위험도가 반대로 나간다.
+      코퍼스 실측(2026-09-02 재확인, `scratchpad/audit_counts.py funds` 로 재현):
+      92개 중 11개·5개 군이 이 구조다.
+
+          교보악사파워인덱스   1호(주식) · 2호
+          미래에셋퇴직플랜     1호(주식) · 1호(채권)
+          베어링고배당         투자회사(주식) · 자투자신탁(주식)   ← 변별자가 같다
+          삼성클래식연금       제1호[주식] · 제1호[채권]
+          한국투자골드플랜연금 1호(국공채) · 1호(채권) · 1호(주식)
+
+      ⚠️ 괄호만 떼는 규칙으로 세면 4개·2군이 나온다. `fund_core` 는 `_FUND_TAIL`
+         (`증권|투자신탁|자투자|[`) 의 **첫 일치 앞**을 자르므로 "증권" 에서 먼저
+         끊긴다. 그래서 `…증권전환형자투자신탁1호(채권)` 과
+         `…증권전환형투자신탁1호(국공채)` 처럼 상품형태 표기가 다른 형제도 같은
+         핵심이름으로 묶인다 — 한국투자·삼성 두 군이 여기서 갈린다.
 
     ■ 형제군에서만 조건을 하나 더 건다
       후보 중 핵심이름이 겹치는 것이 **둘 이상일 때만**, 변별자(괄호 안 국공채·
@@ -398,23 +502,47 @@ def _named_funds(ordered: List[dict], ans_n: str) -> set:
         if len(members) == 1:
             named |= members
             continue
-        named |= {m for m in members
-                  if (v := fund_variant(m)) and _norm(v) in ans_n}
+        # ⚠️ 변별자가 형제끼리 겹치는 군이 있다 — 베어링고배당은 둘 다 "(주식)".
+        #    그때는 상품형태까지 봐야 갈리고, 그래도 안 갈리면 아무도 안 센다
+        #    (`index.loader.fund_discriminators` 주석 참고).
+        ms = sorted(members)
+        for m in ms:
+            keys = fund_discriminators(m, ms)
+            if keys and any(_norm(k) in ans_n for k in keys):
+                named.add(m)
     return named
 
 
 def attach_citations_by_value(answer: str, ordered: List[dict],
-                              cites: List[dict], question: str = ""):
+                              cites: List[dict], question: str = "",
+                              extra_text: str = ""):
     """답변의 값이 실제로 들어 있는 청크를 인용으로 붙인다.
 
     `question` — 클래스코드를 근거로 셀지 가르는 데만 쓴다(`_class_is_topic`).
     안 주면 세지 않는다(보수적 기본값).
 
+    `extra_text` — **검색이 아닌 근거**의 본문 (2026-09-02 신설).
+    여기서 나온 값은 '근거 있는 값'으로 세지만 **인용은 붙지 않는다.**
+
+      계산기 결과가 이 경우다. 10차 D-B3 은 계산 도구가 낸 중간값을 그대로
+      설명했는데 12개 전부 `unsupported_values` 로 잡혔다.
+
+          ② 근속연수공제 = 70,000,000원   ③ 환산급여 = 12,000,000원
+          ⑤ 과세표준 = 1,600,000원        ⑦ 퇴직소득세 = 240,000원
+
+      셋 다 도구가 계산한 값이라 코퍼스 청크에 있을 리가 없다. 지표가 **가장
+      근거가 확실한 답변**을 최악으로 채점하고 있었다 (10차 32개 중 10개가 이
+      한 문항이고, 그중 10개가 재작성이 만든 값으로 기록됐다).
+      인용을 붙이지 않는 이유: 계산 결과는 출처 목록에 넣을 문서가 없다.
+
     반환: (보강된 인용 목록, 어느 청크에도 없는 값 목록)
     """
-    hi, lo, cls = _tokens(answer)
+    hi, lo, cls, per = _tokens(answer)
     if not (hi or lo or cls):
-        return cites, []
+        # 값이 하나도 없는 **서술형 답변**이다. 예전에는 여기서 그냥 끝나서
+        # 인용이 붙을 길이 아예 없었다 — 어휘 대조로 한 번 더 본다.
+        return (cites or _attach_by_wording(
+            answer, ordered, _named_funds(ordered, _norm(answer or "")))), []
 
     # 질문이 클래스를 묻고 있으면 클래스코드도 특이값으로 센다 — 주석 참고.
     if _class_is_topic(question):
@@ -433,18 +561,23 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
     named = _named_funds(ordered, ans_n)
 
     hits = []            # (펀드명 일치, HIGH 수, 클래스 수, LOW 수, 청크, 일치값)
-    covered = set()
+    # 검색 밖 근거(계산기)에서 나온 값은 처음부터 '있는 값'으로 둔다.
+    ehi, elo, ecls, _eper = _tokens(extra_text) if extra_text else \
+        (set(), set(), set(), set())
+    covered = (hi | lo | cls) & (ehi | elo | ecls)
     for ch in ordered:
         # ⚠️ 부분문자열이 아니라 **양쪽에서 뽑은 토큰끼리** 맞춘다 (2026-08-26).
         #    부분문자열 대조는 답변의 "0.28%" 가 청크의 "10.28%" 안에서 걸리고,
         #    "C-P2" 가 "C-P2e" 안에서 걸린다 — 둘 다 다른 펀드를 출처로 붙이는
         #    경로다. 같은 정규식으로 청크에서도 값을 뽑아 집합으로 맞추면
         #    경계가 자동으로 지켜진다.
-        bhi, blo, bcls = _tokens(ch.get("text") or "")
-        body_vals = bhi | blo | bcls
+        # ⚠️ 표 연속 조각은 단위 선언을 잃는다 — 앞 조각의 선언 줄을 이어 붙인다.
+        bhi, blo, bcls, bper = _tokens(chunk_text_for_values(ch))
+        body_vals = bhi | blo | bcls | bper
         mh = hi & body_vals
         ml = lo & body_vals
         mc = cls & body_vals
+        mp = per & body_vals
         # ⚠️ `covered` 에는 클래스코드도 넣는다. 이건 "답변이 말한 값이 근거
         #    어딘가에 있는가" 라는 별개 질문이고, 클래스코드가 근거에 실재하는데
         #    '근거 없는 값' 으로 잡히면 그게 오탐이다. 부착 문턱만 달라진다.
@@ -453,10 +586,11 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
             continue
         fund_ok = bool(named) and _fund_of(ch) in named
         # HIGH 한 개면 충분, LOW 만이면 두 개 이상이어야 붙인다.
-        # 클래스코드는 문턱에 세지 않는다 — 이름표가 겹친 것은 근거가 아니다.
+        # ⚠️ 클래스코드·기간라벨은 문턱에 세지 않는다 — 이름표가 겹친 것은
+        #    근거가 아니다. 정렬에만 쓴다(`_TOK_PERIOD` 주석의 P-E5 실측 참고).
         if mh or len(ml) >= 2:
-            hits.append((1 if fund_ok else 0, len(mh), len(mc), len(ml), ch,
-                         sorted(mh | ml | mc)))
+            hits.append((1 if fund_ok else 0, len(mh), len(mc), len(ml) + len(mp),
+                         ch, sorted(mh | ml) + sorted(mc | mp)))
 
     # 답변이 펀드를 특정했는데 그 펀드 청크가 하나라도 걸렸다면, 다른 펀드는 버린다
     if any(h[0] for h in hits):
@@ -468,13 +602,97 @@ def attach_citations_by_value(answer: str, ordered: List[dict],
         c = to_citation(ch)
         c["n"] = nxt
         c["auto"] = True                       # 코드가 붙인 것임을 표시
+        # 값을 앞에 둔다 — quote 가 이름표(`C-e`·`3년`)로만 채워지면 무엇을
+        # 근거로 붙였는지 사람이 읽을 수 없다 (10차 P-E5 의 quote 3건이 그랬다).
         c["quote"] = "값 일치: " + ", ".join(matched[:4])
         cites.append(c)
         nxt += 1
 
-    # 어느 청크에도 없는 값 = 근거 없이 말한 수치
+    # 값으로 아무것도 못 붙였으면 **어휘**로 한 번 더 본다 — 아래 주석 참고.
+    if not cites:
+        cites = _attach_by_wording(answer, ordered, named)
+
+    # 어느 청크에도 없는 값 = 근거 없이 말한 수치.
+    # 기간라벨(`per`)은 값이 아니므로 넣지 않는다 — 위 `_TOK_PERIOD` 주석 참고.
     unsupported = sorted((hi | lo | cls) - covered)
     return cites, unsupported
+
+
+# 어휘 대조로 붙일 최대 건수. 값 대조와 달리 "어느 대목을 옮겼나" 라 하나면 족하다.
+_WORD_MAX = 1
+# 중앙값 대비 이 배수를 넘어야 붙인다. 후보 안에서 **혼자 튀어야** 근거다.
+_WORD_MARGIN = 2.5
+# 2등과도 이 배수만큼 벌어져야 한다. 1·2등이 붙어 있으면 어느 쪽인지 못 고른다 —
+# 그때는 **아무것도 안 붙이는 것**이 맞다. 틀린 출처를 다는 것보다 낫다.
+#   실측 P-C4: 1위 2.50x · 2위 2.50x 로 동점인데 정답은 4위였다 → 안 붙인다
+#         P-G0b: 4.07x 대 2.93x (1.39배 차) → 붙인다. 정답 청크가 1위였다
+_WORD_GAP = 1.15
+
+
+def _attach_by_wording(answer: str, ordered: List[dict], named: set) -> List[dict]:
+    """숫자가 없는 **서술형 답변**의 출처를 어휘로 되찾는다 (2026-09-02 신설).
+
+    ■ 왜 필요한가 — 값 대조는 숫자가 있어야 돈다
+      10차 검증 실행의 인용 0건 15건 중 6건이 "답변은 정상인데 인용만 없는" 경우였고,
+      전부 숫자가 없는 사실조회였다.
+
+          P-G0b "넣은 돈은 어디에 보관되나요"  → 답변: ㈜우리은행이 신탁업자로 보관
+          P-F2  "주로 뭐에 투자해요"            → 답변: 국내 주식 60% 이상
+          P-C4  "C1 클래스는 왜 가입이 안 되나" → 답변: 선행 클래스 보유 필요
+
+      셋 다 근거 청크가 검색에 들어와 있었고 답변도 맞았다. 붙일 방법이 없었을 뿐이다.
+      근거표시가 평가 지표이므로 이건 그대로 점수 손실이다.
+
+    ■ 왜 어휘(BM25)인가 — 의미 유사도가 아니라 **전사 여부**를 묻는 것이다
+      "이 답변이 이 청크의 말을 옮겼는가" 는 어휘 문제다. 의미가 비슷한 것으로
+      치면 **다른 펀드의 같은 조항**이 1등으로 올라온다(투자설명서는 문서 92종이
+      거의 같은 문구를 쓴다). 어휘 쪽은 고유명사·희소어에 IDF 가 실려 그 펀드
+      문서를 고른다.
+
+      실측 — 답변을 질의로 넣고 그 펀드 문서 88청크 안에서 순위를 봤다.
+          P-G0b  정답(관련회사·신탁업자) 1위·2위
+          P-F2   정답(투자전략 60%)      2위 (1위는 같은 문구의 별첨1)
+          P-C4   정답                     4위
+      검색 전체가 아니라 **이미 검색·채점을 통과한 후보 안에서만** 고르므로
+      실제 조건은 이보다 좁다.
+
+    ■ 붙이는 조건을 좁게 잡는다
+      · 값 대조가 **하나도** 못 붙였을 때만 돈다 (값이 있으면 값이 우선이다)
+      · 후보 중 **혼자 튈 때만** — 중앙값의 2.5배 미만이면 안 붙인다
+      · 최대 1건. 답변이 어디서 왔는지 가리키는 것이지 목록을 채우는 게 아니다
+      · 답변이 펀드를 특정했으면 그 펀드 청크만 본다 (값 대조와 같은 가드)
+    """
+    if not (config.ATTACH_CITES_BY_WORDING and ordered):
+        return []
+    pool = [c for c in ordered if not named or _fund_of(c) in named or not _fund_of(c)]
+    if len(pool) < 3:
+        return []
+    try:
+        from index.store import BM25
+        from utils import tokenize_ko
+        bm = BM25([tokenize_ko(chunk_text_for_values(c)) for c in pool])
+        raw = bm.scores(tokenize_ko(answer or ""), list(range(len(pool))))
+    except Exception as e:                       # 인용 부착이 답변을 막으면 안 된다
+        log.warning("어휘 인용 대조 건너뜀: %s", e)
+        return []
+    scores = [raw.get(i, 0.0) for i in range(len(pool))]
+    if not any(scores):
+        return []
+    ranked = sorted(range(len(pool)), key=lambda i: -scores[i])
+    mid = sorted(scores)[len(scores) // 2] or 1e-9
+    out: List[dict] = []
+    second = scores[ranked[1]] if len(ranked) > 1 else 0.0
+    for i in ranked[:_WORD_MAX]:
+        if scores[i] < mid * _WORD_MARGIN:
+            break
+        if second and scores[i] < second * _WORD_GAP:
+            break                    # 1·2등이 붙어 있다 — 고를 수 없으면 안 붙인다
+        c = to_citation(pool[i])
+        c["n"] = len(out) + 1
+        c["auto"] = True
+        c["quote"] = f"서술 근거 (어휘 일치 {scores[i] / mid:.1f}배)"
+        out.append(c)
+    return out
 
 
 def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set,
@@ -500,7 +718,7 @@ def _restored_cite_ok(ch: dict, answer: str, hi: set, lo: set,
     if fund in named:
         return True                     # 답변이 이 펀드를 직접 언급했다
                                         # (형제펀드면 변별자까지 맞아야 한다)
-    bhi, blo, _bcls = _tokens(ch.get("text") or "")
+    bhi, blo, _bcls, _bper = _tokens(chunk_text_for_values(ch))
     body_vals = bhi | blo               # 클래스코드는 근거로 안 센다
     if hi & body_vals:
         return True                     # 답변의 특이값이 이 카드에 실제로 있다
@@ -609,7 +827,7 @@ def generate_answer(state: RAGState) -> dict:
     #        붙는다(P-A4: 답변 표에 없는 펀드가 출처로). 그래서 복원 대상이
     #        펀드카드인 경우 답변이 그 펀드를 실제로 말했는지 대조한다.
     if not cites and res.main_answer:
-        hi, lo, _cls = _tokens(res.main_answer)
+        hi, lo, _cls, _per = _tokens(res.main_answer)
         # 클래스코드 취급을 값 대조 경로와 똑같이 맞춘다 — 질문이 클래스를
         # 묻는 문항에서만 근거로 센다(`_class_is_topic`).
         if _class_is_topic(f"{original} {question}"):

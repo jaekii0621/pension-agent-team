@@ -49,7 +49,7 @@ from typing import List
 from pydantic import BaseModel, Field
 
 import config
-from index import (fund_core, fund_names, fund_variant, match_known_funds,
+from index import (fund_core, fund_discriminators, fund_names, match_known_funds,
                    product_signal, sibling_funds)
 from llm import llm
 from prompt import prompts
@@ -142,7 +142,10 @@ def _resolve_siblings(question: str, names: List[str]) -> List[str]:
         group = sibling_funds(n)
         if len(group) > 1:
             # 질문이 변별자를 명시했으면 그 형제만 남긴다.
-            pinned = [g for g in group if (v := fund_variant(g)) and v in q]
+            # ⚠️ 변별자가 겹치는 군은 상품형태까지 본다 — 세 노드가 같은 규칙을
+            #    써야 "질문이 지목한 펀드"와 "답변이 말한 펀드" 판정이 안 어긋난다.
+            pinned = [g for g in group
+                      if any(k in q for k in fund_discriminators(g, group))]
             group = pinned or group
         for g in group:
             if g not in out:

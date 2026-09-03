@@ -8,17 +8,22 @@
 
 from . import artifact                                   # noqa: F401
 from .loader import (                                    # noqa: F401
+    chunk_by_id,
+    chunk_text_for_values,
     corpus_stats,
     format_chunk_for_llm,
     fund_core,
+    fund_discriminators,
     fund_names,
     fund_variant,
     is_table_chunk,
+    is_table_continuation,
     load_corpus,
     match_known_fund,
     match_known_funds,
     searchable_text,
     sibling_funds,
+    table_neighbor_ids,
     to_citation,
 )
 from .store import (                                     # noqa: F401
@@ -32,7 +37,9 @@ from .store import (                                     # noqa: F401
 __all__ = [
     "load_corpus", "corpus_stats", "format_chunk_for_llm", "to_citation",
     "fund_names", "match_known_fund", "match_known_funds",
-    "fund_core", "fund_variant", "sibling_funds",
+    "fund_core", "fund_variant", "sibling_funds", "fund_discriminators",
+    "chunk_by_id", "chunk_text_for_values",
+    "is_table_continuation", "table_neighbor_ids",
     "searchable_text", "is_table_chunk",
     "PensionIndex", "get_index", "reset_index",
     "bm25_top1", "product_signal",
