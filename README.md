@@ -61,9 +61,13 @@ copy .env.example .env        # 값 채우기
 ```
 
 ```bash
-python run_cli.py --check                      # 데이터·설정 점검 (API 키 불필요)
-python run_cli.py "IRP 중도인출 사유가 뭔가요?"
-python -m eval.runner --retrieval-only          # 검색 성능만 (LLM 호출 0회)
+python run_cli.py --check                      # 설정·데이터 점검 (API 키 불필요)
+python run_cli.py "IRP 중도인출 사유가 뭔가요?"  # 질문 1건
+python run_cli.py                               # 대화형 (빈 줄/exit로 종료)
+python run_cli.py "..." --mermaid               # 실행 경로를 mermaid로 출력
+python run_cli.py "..." --json                  # 최종 state 출력
+python run_cli.py "..." --profile '{"total_salary":60000000}'
+python run_cli.py --queryset                    # 자체 평가 질의세트 78문항 배치 실행 (eval/run_queryset.py)
 ```
 
 ### 2-2. 서버 (평가용 API — 이 프로젝트의 제출 대상)
@@ -188,7 +192,8 @@ pension_agent/
 │   ├── runner.py             실행기
 │   └── run_queryset.py       질의세트 배치 실행
 │
-├── data/tax_tables.json    세율표 (코드가 읽음, LLM 아님)
+├── data/                    코퍼스 원본 (청크 파일 전체 — 5절 데이터 표 참고)
+│   └── tax_tables.json      세율표 (코드가 읽음, LLM 아님)
 ├── API_SPEC.md           ★ 평가용 API 서버 명세 (요청/응답 스키마)
 └── docs/PIPELINE.md       ★ 질문이 지나가는 전 과정 상세 설명
 ```
@@ -197,41 +202,32 @@ pension_agent/
 
 ## 5. 데이터
 
-| 파일 | source | 건수 | 신뢰도 |
-|---|---|---:|---|
-| `chunks_genre_a.jsonl` | 제도 | **208** (doc10~19 + doc29 포함, 2026-09-05 기준) | 규정 문서 (높음) |
-| `chunks_genre_b.jsonl` | 세제 | 160 | 규정 문서 (높음) |
-| `chunks_genre_c.jsonl` | 중도인출절차 | 38 | 규정 문서 (높음) |
-| `chunks_genre_d.jsonl` | 일반절차 | 244 | 규정 문서 (높음) |
-| `fund_cards.jsonl` | 상품 | 92 | 투자설명서 (낮음) |
+코퍼스는 정책 트랙(제도·세제·절차)과 상품 트랙(투자설명서) 둘로 나뉘며, 검색 자원 배분과 출처 신뢰도 가중에 이 구분이 쓰인다. 아래 수치는 기술제안서 3-1절 기준(2026-09-06 최종 확정)이며, 서버 `data/` 폴더 실제 파일과 라인 수 대조 완료.
 
-> ⚠️ **총합은 서윤님 최신본 확인 후 갱신 예정.** 제도(A) 청크가 이전 기록(90~108개) 대비 208개로 늘어난 것은 doc29 추가에 따른 것으로 확인됨(2026-09-05). B/C/D/fund_cards는 8/16 실측치와 일치하나, 이후 변경 여부는 서윤님 재확인 필요.
+| 트랙 | 파일 | chunk_type | 건수 |
+|---|---|---|---:|
+| 정책 (1,173) | `data/chunks_genre_a.jsonl` | qa (제도 Q&A) | 208 |
+| | `data/chunks_genre_b.jsonl` | tax (세제 해설·세율표) | 160 |
+| | `data/chunks_genre_c.jsonl` | withdrawal (중도인출 사유별 요건) | 38 |
+| | `data/chunks_genre_d.jsonl` + `data/chunks_ocr_batch.jsonl` | procedure (업무 절차·매뉴얼) | 767 (244+523) |
+| 상품 (7,904) | `data/fund_cards.jsonl` | fund_card (펀드 단위 정본 카드) | 92 |
+| | `data/class_cards.jsonl` | class_card (클래스 단위 정본 카드) | 91 |
+| | `data/section_chunks.jsonl` | prospectus_section (투자설명서 섹션 원문) | 7,721 |
+
+**총 9,077 청크** (원본 문서 150건 — 상품 92, 정책 58).
 
 로딩 시 파생되는 태그 (`index/loader.py`)
 
 - `계좌유형` : IRP, 연금저축, DC, DB, 중소기업퇴직연금
 - `금융주제` : 21종 (부담금납입, 적립금운용, 중도인출 등)
 - `금융목적` : 주택구입, 요양, 파산개인회생, 전세보증금, 재난피해
-- `distractor` : 제도 파일의 '첨부-관련법령' → 검색 점수 하향 반영
+- `distractor` : 제도 파일의 '첨부-관련법령' → 검색 점수 하향 반영 (가중치 0.35)
 
 ---
 
 ## 6. 측정된 결과
 
-### 6-1. 검색 단독 성능 (BM25, 임베딩 미적용 상태 — 초기 측정)
-
-`python -m eval.runner --retrieval-only` — 골드셋 12건(검색 지표 대상)
-
-| 조건 | Recall | Hit | MRR | Precision |
-|---|---:|---:|---:|---:|
-| 필터 없음 | 0.600 | 0.750 | 0.541 | 0.174 |
-| **소스 필터 적용** | **0.717** | **0.917** | **0.653** | **0.224** |
-
-→ **소스 필터 하나로 Recall +11.7%p, Hit +16.7%p.**
-
-⚠️ `--retrieval-only`는 질문을 쪼개지 않고 통째로 검색하므로 복합 질문을 과소평가한다 → **단일 질문 검색의 하한선**으로 읽어야 한다.
-
-### 6-2. 파이프라인 11차 실행 결과 (2026-09-02, `colab_full_20260902_141622.json` / `FIX_11차_20260902.md`)
+파이프라인 11차 실행 결과 (2026-09-02, `colab_full_20260902_141622.json` / `FIX_11차_20260902.md`)
 
 | 지표 | 값 |
 |---|---:|
@@ -241,22 +237,24 @@ pension_agent/
 | 게이트 거절(gate refusals) | 4 → 3 |
 | 근거 불충분 값(unsupported_values) | 32 → 11 |
 
+> 이전 버전에 있던 BM25 단독 검색 성능표(494청크, 하드 필터 기준)는 삭제함 — `config.py` 확인 결과 2026-08-16 재개편으로 하드 필터 자체가 폐지되어(소프트 필터+계층 쿼터로 대체) 더 이상 유효한 실험 조건이 아님. 최신 차수별 지표는 기술제안서 7-2절 참고.
+
 ---
 
 ## 7. 성능 실험 설계
 
-`config.WORKFLOW_SETTINGS` 를 바꿔가며 `--tag` 를 다르게 주고 돌린 뒤 `eval/results/` 를 비교한다.
+`config.WORKFLOW_SETTINGS`를 바꿔가며 `--tag`를 다르게 주고 돌린 뒤 `eval/results/`를 비교한다. (2026-09-06, `config.py` 실제 키 대조 완료)
 
 | 실험 | 바꿀 설정 | 보는 것 |
 |---|---|---|
 | baseline | grade_documents=F, check_hallucination=F, grade_answer=F | 순수 검색+생성 기준선 |
 | +문서채점 | grade_documents=T | 관련성 채점의 기여 |
 | +검증 | check_hallucination=T, grade_answer=T | 환각·품질 검증의 기여 |
-| +HyDE | rewrite_with_hyde=T | HyDE 의 기여 (재작성 경로에서만 발동) |
-| +서브질문필터 | per_subquestion_filters=T | 서브질문별 필터 정제의 기여 |
-| +RRR | repeat_residual=T, MAX_ROUNDS=2 | 잔여 재분해의 기여 |
-| 임베딩 | build_index 실행 전/후 | 하이브리드 검색의 기여 |
-| top-k | PENSION_TOP_K=3/5/7 | 폭 vs 지연 |
+| +HyDE | rewrite_with_hyde=T | HyDE의 기여 (재작성 경로에서만 발동) |
+| +소프트필터 | metadata_filtering=T | 사유·펀드명 소프트필터 + 단계적 완화의 기여 |
+| +RRR | repeat_residual=T, `PENSION_MAX_ROUNDS`(기본 2) | 잔여 재분해의 기여 |
+| 임베딩 | `python -m index.build_index` 실행 전/후 | 하이브리드 검색(BM25+벡터)의 기여 |
+| top-k | `PENSION_TOP_K`(기본 8) / `PENSION_TOP_K_RECOMMEND`(기본 24) | 폭 vs 지연 |
 
 ---
 
